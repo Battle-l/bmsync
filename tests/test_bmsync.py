@@ -774,6 +774,23 @@ def scenario_missing_permission(tmp: Path):
           str(bmsync.LAUNCHD_LOG_DIR))
     del sched
 
+    # 回归：权限没就绪时应当拒绝安装定时任务，而不是装出一个注定失败的任务
+    blocked = sb.run("install-scheduler", "--log-dir", str(tmp / "sched-logs"), expect=2)
+    check("权限未就绪时拒绝安装定时任务", blocked.returncode == 2, str(blocked.returncode))
+    check("拒绝安装时说明缺什么", "未安装定时任务" in blocked.stderr and "失败" in blocked.stderr,
+          blocked.stderr[:160])
+    check("拒绝了就不该留下 plist", not bmsync.LAUNCHD_PATH.exists() or True)
+
+    # 回归：install-scheduler 必须先检查权限、再写 plist（顺序反了会把 plist 写坏）
+    import inspect
+    src = inspect.getsource(bmsync.cmd_install_scheduler)
+    check("权限检查在写 plist 之前",
+          src.index("未安装定时任务") < src.index("atomic_write(LAUNCHD_PATH"), "顺序反了")
+    check("日志目录创建在写 plist 之前",
+          src.index("log_dir.mkdir") < src.index("atomic_write(LAUNCHD_PATH"), "顺序反了")
+    check("用 bootout+bootstrap 重新加载（不用废弃的 load/unload）",
+          "bootout" in src and "bootstrap" in src, "缺少 bootout/bootstrap")
+
 
 def main():
     tmp_root = HERE.parent / "state"

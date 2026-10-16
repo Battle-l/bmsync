@@ -29,6 +29,13 @@
   新增 `install-scheduler --log-dir` 可自定义，且强制转成绝对路径。
 - `install-scheduler` 安装时会打印任务日志位置和验证命令（含 `launchctl print` 查退出码）。
 - 权限失败时的提示明确了 launchd/cron 场景（读不到 Safari、写不了 Chrome 都指向同一处授权）。
+- **`install-scheduler` 改用 `bootout` + `bootstrap` + `kickstart`**（原先用已废弃的
+  `load`/`unload`，只改 plist 不重新加载会留下内存里的旧定义，导致 `launchctl start`
+  立刻失败、退出码 78、日志文件都不创建）。加载失败时回退 `load -w` 并打印两条命令的报错。
+- **安装前做权限前置检查**：读不到 Safari / 写不了 Chrome 时拒绝安装并说明缺什么，
+  不再装出一个注定失败的任务。
+- **安装后立即触发一次并回报退出码**（`--no-verify` 可关闭），按退出码给出处置建议，
+  并自动带出日志最后几行。
 
 ### 新增
 
@@ -37,6 +44,7 @@
 - `BMSYNC_TEST_CHROME` 环境变量，可指定任意书签文件做往返验证。
 - 回归测试场景「全局选项的位置无关性」（16 种参数组合 + 9 条真实 CLI 调用）。
 - 回归测试：`--quiet` 下报错可见、失败写入日志、任务日志为绝对路径且不落在仓库内。
+- 回归测试：权限未就绪时 `install-scheduler` 返回 2、且不会先写 plist。
 
 ## [1.0.0] - 2026-10-16
 

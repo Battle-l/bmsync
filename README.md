@@ -18,7 +18,7 @@ Safari Bookmarks.plist ──┘   (基线 state.json)    └─→ 写回 Safar
 - 冲突按修改时间判定，并逐条打印冲突说明
 - 每次写入前自动备份两边原文件，随时可回滚
 - 支持 launchd 定时同步
-- 73 项端到端测试（含对真实 Chrome 书签的无损往返验证）
+- 79 项端到端测试（含对真实 Chrome 书签的无损往返验证）
 
 ---
 
@@ -92,7 +92,14 @@ Safari 的书签文件受 macOS 的 TCC 保护，`chmod`、`sudo` 都没用，�
 ./bin/bmsync init-config                       # 先生成配置文件
 ./bin/bmsync install-scheduler --interval 60   # 每 60 分钟一次（最小 5 分钟）
 ./bin/bmsync install-scheduler --dry-run       # 只看看会写入什么，不真装
+./bin/bmsync install-scheduler --no-verify     # 装完不立即触发验证
 ```
+
+安装命令做完三件事，尽量不留悬念：
+
+1. **先做权限前置检查** —— 读不到 Safari 或写不了 Chrome 就直接拒绝安装，并告诉你缺哪一项（避免装了个注定失败的任务）；
+2. **先卸掉内存里的旧定义再装新的**（`bootout` + `bootstrap`）—— 只改 plist 文件而不重新加载，launchd 里跑的还是旧配置，这正是"`launchctl start` 立刻失败、退出码 78、连日志都没有"的常见原因；
+3. **立刻触发一次并回报退出码** —— 不用等一个同步周期就知道行不行。
 
 装好后，**务必按下面的方式确认它真的生效了**（`launchctl start` 是异步的，敲完不代表跑成功）：
 
@@ -234,7 +241,7 @@ cp state/backups/chrome.20261016-195845.bak \
 bmsync/
 ├── bmsync.py                    # 全部实现，单文件，纯标准库
 ├── bin/bmsync                   # 启动器（可直接 ./bin/bmsync sync）
-├── tests/test_bmsync.py         # 73 项端到端测试
+├── tests/test_bmsync.py         # 79 项端到端测试
 ├── .github/
 │   ├── workflows/tests.yml      # CI：macOS 上跑测试 + lint
 │   └── ISSUE_TEMPLATE/          # Issue 模板（引导附带 doctor 输出）

@@ -1934,6 +1934,14 @@ LAUNCHD_PATH = HOME / ("Library/LaunchAgents/%s.plist" % LAUNCHD_LABEL)
 LAUNCHD_LOG_DIR = HOME / "Library/Logs/bmsync"
 
 
+def launchd_domain() -> str:
+    return "gui/%d" % os.getuid()
+
+
+def launchctl(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["launchctl"] + list(argv), capture_output=True, text=True)
+
+
 def cmd_install_scheduler(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     script = Path(__file__).resolve()
     # 优先用系统自带的 python3：路径稳定，且方便在"完全磁盘访问权限"里单独勾选
@@ -1941,12 +1949,34 @@ def cmd_install_scheduler(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     interval = max(5, int(args.interval)) * 60
     # 必须转成绝对路径：相对路径会被 launchd 按 WorkingDirectory 解析，容易踩坑
     log_dir = (expand(args.log_dir).resolve() if getattr(args, "log_dir", None) else LAUNCHD_LOG_DIR)
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        eprint("无法创建日志目录 %s：%s" % (log_dir, exc))
-        eprint("可以换一个位置：bmsync install-scheduler --log-dir ~/somewhere")
-        return 1
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    # 权限没就绪就别装了：定时任务失败时很难查（连日志都可能创建不出来）。
+    # 演练模式不写任何文件，跳过这项检查。
+    if not dry_run:
+        blockers = []
+        for backend in build_backends(cfg):
+            readable, msg = check_readable(backend.bookmarks_path)
+            if not readable:
+                blockers.append("%s 读取失败：%s" % (backend.label, msg))
+                continue
+            writable, msg_w = check_writable(backend.bookmarks_path)
+            if not writable:
+                blockers.append("%s 写入失败：%s" % (backend.label, msg_w))
+        if blockers:
+            eprint("未安装定时任务：当前权限还不足以同步，先解决下面的问题再装。")
+            for b in blockers:
+                eprint("  ✗ %s" % b)
+            eprint("  提示：先跑 bmsync doctor 完整自检。定时任务由 launchd 拉起，")
+            eprint("        需要把 %s 单独加入“完全磁盘访问权限”，不会继承终端的授权。" % python)
+            return 2
+
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            eprint("无法创建日志目录 %s：%s" % (log_dir, exc))
+            eprint("可以换一个位置：bmsync install-scheduler --log-dir ~/somewhere")
+            return 1
     # 只有配置文件确实存在时才传 --config，否则让它走默认查找逻辑
     argv = [python, str(script)]
     config_arg = str(Path(args.config).resolve()) if args.config else str(APP_DIR / "config.json")
@@ -1965,21 +1995,64 @@ def cmd_install_scheduler(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
         "WorkingDirectory": str(APP_DIR),
     }
     data = plistlib.dumps(plist, fmt=plistlib.FMT_XML)
-    if getattr(args, "dry_run", False):
+    if dry_run:
         print("将写入：%s（每 %d 分钟一次）\n" % (LAUNCHD_PATH, interval // 60))
         print(data.decode("utf-8"))
         print("演练模式：未写入文件、未调用 launchctl。")
         return 0
     LAUNCHD_PATH.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(LAUNCHD_PATH, data)
-    subprocess.run(["launchctl", "unload", str(LAUNCHD_PATH)], capture_output=True)
-    res = subprocess.run(["launchctl", "load", str(LAUNCHD_PATH)], capture_output=True, text=True)
-    print("已写入定时任务：%s（每 %d 分钟一次）" % (LAUNCHD_PATH, interval // 60))
-    if res.returncode != 0:
-        eprint("launchctl load 失败：%s%s" % (res.stdout, res.stderr))
-        eprint("可手动执行：launchctl load -w %s" % LAUNCHD_PATH)
-        return 1
-    print("查看：launchctl list | grep bmsync     立即运行：launchctl start %s" % LAUNCHD_LABEL)
+
+    # 必须先把旧定义从 launchd 内存里卸掉再装新的。只写文件不重新 bootstrap 的话，
+    # 内存里留的还是上一份定义（可能指向已失效的解释器路径），表现为 `launchctl start`
+    # 立刻失败、退出码 78（EX_CONFIG）、连日志文件都不会被创建。
+    bootout = launchctl("bootout", "%s/%s" % (launchd_domain(), LAUNCHD_LABEL))
+    bootstrapped = launchctl("bootstrap", launchd_domain(), str(LAUNCHD_PATH))
+    if bootstrapped.returncode != 0:
+        # 老系统或特殊环境下的兜底：load -w 也能加载，但不如 bootstrap 可靠
+        legacy = launchctl("load", "-w", str(LAUNCHD_PATH))
+        if legacy.returncode != 0:
+            eprint("加载定时任务失败。")
+            eprint("  bootstrap: %s" % (bootstrapped.stderr.strip() or bootstrapped.stdout.strip()))
+            eprint("  load     : %s" % (legacy.stderr.strip() or legacy.stdout.strip()))
+            eprint("请手动执行：launchctl bootstrap %s %s" % (launchd_domain(), LAUNCHD_PATH))
+            return 1
+    print("已写入并加载定时任务：%s（每 %d 分钟一次）" % (LAUNCHD_PATH, interval // 60))
+    if bootout.returncode == 0:
+        print("（已先卸载内存中的旧定义，避免残留旧配置）")
+    del bootout
+    print("查看：launchctl print %s/%s | grep -E 'last exit code|state'" % (launchd_domain(), LAUNCHD_LABEL))
+    print("立即运行：launchctl kickstart -k %s/%s" % (launchd_domain(), LAUNCHD_LABEL))
+
+    # 立刻跑一次，当场验证（否则要等一个周期才知道行不行）
+    if getattr(args, "verify", True):
+        print("\n正在立即触发一次以验证配置……")
+        launchctl("kickstart", "-k", "%s/%s" % (launchd_domain(), LAUNCHD_LABEL))
+        code = None
+        for _ in range(20):                     # 最多等 10 秒
+            time.sleep(0.5)
+            info = launchctl("print", "%s/%s" % (launchd_domain(), LAUNCHD_LABEL))
+            m = re.search(r"last exit code = (\d+)", info.stdout)
+            if m:
+                code = int(m.group(1))
+                break
+        log_path = state_paths(cfg)["log"]
+        if code == 0:
+            print("  ✅ 退出码 0：定时任务可以正常同步（细节见 %s）" % log_path)
+        elif code is None:
+            print("  ⚠️  没读到退出码，请手动确认：launchctl print %s/%s" % (launchd_domain(), LAUNCHD_LABEL))
+        else:
+            print("  ❌ 退出码 %d：任务启动了但同步没成功。" % code)
+            if code == 2:
+                print("     多半是定时任务没有磁盘访问权限：系统设置 → 隐私与安全性 → 完全磁盘访问权限")
+                print("     点 + 号 → Cmd+Shift+G → 输入 %s → 添加后重新运行本命令。" % python)
+            elif code == 3:
+                print("     浏览器没退出：退出 Chrome/Safari 后重新触发。")
+            print("     具体原因见：%s" % log_path)
+            if log_path.exists():
+                tail = log_path.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-3:]
+                for line in tail:
+                    print("       | %s" % line)
     print("任务日志：%s/scheduler.{out,err}.log" % log_dir)
     print("改动记录：%s（每次同步的成功/失败都会写在这里）" % state_paths(cfg)["log"])
     print("")
@@ -1993,10 +2066,11 @@ def cmd_install_scheduler(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
 
 
 def cmd_uninstall_scheduler(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    launchctl("bootout", "%s/%s" % (launchd_domain(), LAUNCHD_LABEL))
+    launchctl("unload", str(LAUNCHD_PATH))          # 兜底：老式加载方式的清理
     if not LAUNCHD_PATH.exists():
-        print("未安装定时任务。")
+        print("已卸载定时任务（未发现 plist 文件）。")
         return 0
-    subprocess.run(["launchctl", "unload", str(LAUNCHD_PATH)], capture_output=True)
     LAUNCHD_PATH.unlink()
     print("已移除 %s" % LAUNCHD_PATH)
     return 0
@@ -2122,6 +2196,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = new_sub("install-scheduler", help="安装 launchd 定时同步任务")
     p.add_argument("--interval", type=int, default=60, help="间隔分钟（默认 60，最小 5）")
     p.add_argument("--log-dir", help="任务日志目录（默认 ~/Library/Logs/bmsync）")
+    p.add_argument("--no-verify", dest="verify", action="store_false", default=True,
+                   help="安装后不立即触发一次验证")
     p.add_argument("--dry-run", "-n", action="store_true", help="只打印将要写入的 plist，不安装")
     p.set_defaults(func=cmd_install_scheduler)
 
