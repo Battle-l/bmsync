@@ -37,6 +37,19 @@
 - **安装后立即触发一次并回报退出码**（`--no-verify` 可关闭），按退出码给出处置建议，
   并自动带出日志最后几行。
 
+### 新增（实时同步与工作模式）
+
+- **三种工作模式**，用 `bmsync mode` 查看/切换并把选择写进 `config.json`：
+  `manual`（手动）、`scheduled`（定时）、`watch`（实时）。切换时会自动清理另一种自动方式，
+  避免两套机制同时写书签（`--keep-scheduler` 可保留）。
+- **`bmsync watch` 实时同步**：轮询两个书签文件的大小 + mtime，检测到变化后等 `settle` 秒
+  确认写完，再触发一次完整同步。参数（`interval` / `settle` / `resync_after`）可在配置里调。
+- **`bmsync watch-daemon start|stop|status|restart`**：把实时同步装成 launchd 常驻服务
+  （`RunAtLoad` + `KeepAlive`，崩溃后自动拉起）。
+- `bmsync watch --verify` 自检；`--once N` 只监听 N 秒便于脚本化验证。
+- 用 `flock` 保证单实例：已有 watch 在跑时拒绝启动第二个。
+- 新增环境变量 `BMSYNC_LAUNCHD_DIR` 覆盖 LaunchAgents 目录（测试隔离，也方便非标准环境）。
+
 ### 新增
 
 - `tests/test_bmsync.py` 加入合成 Chrome 书签夹具：没有真实 Chrome 书签文件时也能完整测试，
@@ -45,6 +58,8 @@
 - 回归测试场景「全局选项的位置无关性」（16 种参数组合 + 9 条真实 CLI 调用）。
 - 回归测试：`--quiet` 下报错可见、失败写入日志、任务日志为绝对路径且不落在仓库内。
 - 回归测试：权限未就绪时 `install-scheduler` 返回 2、且不会先写 plist。
+- 实时同步场景 18 项：双向实时同步、单实例锁、`--verify` / `--once`、
+  常驻服务 plist（KeepAlive/RunAtLoad）、模式切换与自动清理（沙盒内验证不碰真实系统）。
 
 ## [1.0.0] - 2026-10-16
 

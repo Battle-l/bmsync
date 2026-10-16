@@ -17,8 +17,8 @@ Safari Bookmarks.plist ──┘   (基线 state.json)    └─→ 写回 Safar
 - 支持 macOS 自带 Python 3.9+，无第三方依赖
 - 冲突按修改时间判定，并逐条打印冲突说明
 - 每次写入前自动备份两边原文件，随时可回滚
-- 支持 launchd 定时同步
-- 79 项端到端测试（含对真实 Chrome 书签的无损往返验证）
+- 三种工作模式：手动 / 定时（launchd）/ **实时（监听文件变化）**
+- 97 项端到端测试（含对真实 Chrome 书签的无损往返验证）
 
 ---
 
@@ -72,6 +72,13 @@ Safari 的书签文件受 macOS 的 TCC 保护，`chmod`、`sudo` 都没用，�
 ./bin/bmsync export --format html      # 导出成可手动导入的 HTML（放到 state/export/）
 ./bin/bmsync import ~/Downloads/bookmarks.html   # 把外部导出的书签并进来，再同步到两边
 ./bin/bmsync init-config               # 生成可编辑的 config.json
+
+./bin/bmsync mode                      # 查看当前工作模式
+./bin/bmsync mode watch                # 切到实时模式（会自动清理定时任务，避免两套机制打架）
+./bin/bmsync watch                     # 前台运行实时同步（Ctrl+C 退出）
+./bin/bmsync watch-daemon start        # 实时同步装成常驻服务（登录自启、掉线拉起）
+./bin/bmsync watch-daemon status       # 看常驻服务状态
+./bin/bmsync watch --verify            # 实时模式自检：权限、指纹、参数
 ```
 
 全局选项（`-v`、`-vv`、`--json` / `-t`、`--config`）写在**子命令前后都有效**，下面这些写法等价：
@@ -86,7 +93,62 @@ Safari 的书签文件受 macOS 的 TCC 保护，`chmod`、`sudo` 都没用，�
 
 **同步前请退出 Chrome 和 Safari。** 浏览器运行时会把内存里的旧数据写回磁盘，覆盖掉我们的改动。脚本会检测并拒绝执行（确认无碍时可加 `--force`）。
 
-## 3. 定时同步
+## 3. 三种工作模式
+
+用 `bmsync mode` 查看、`bmsync mode <模式>` 切换（会写进 `config.json` 的 `mode` 字段，切换时会自动清理另一种自动方式，避免两套机制同时写书签）。
+
+| 模式 | 触发方式 | 适合谁 |
+| --- | --- | --- |
+| `manual` | 只有你手动跑 `bmsync sync` 才同步 | 想完全掌控、偶尔同步一次 |
+| `scheduled` | launchd 每 N 分钟同步一次 | 想要"无感"，能接受分钟级延迟 |
+| `watch` | 常驻进程盯着书签文件，一变就同步 | 想要接近实时 |
+
+```bash
+./bin/bmsync mode              # 看当前模式（同时显示定时任务/常驻服务是否在跑）
+./bin/bmsync mode watch        # 切到实时
+./bin/bmsync mode scheduled    # 切到定时
+./bin/bmsync mode manual       # 关掉所有自动同步
+```
+
+### 实时模式（watch）
+
+```bash
+./bin/bmsync watch                      # 前台运行，Ctrl+C 退出（想先观察就用这个）
+./bin/bmsync watch-daemon start         # 后台常驻：登录自启、进程掉了自动拉起
+./bin/bmsync watch-daemon status        # 看状态（PID / 上次退出码）
+./bin/bmsync watch-daemon stop          # 停止并移除
+./bin/bmsync watch --once 10            # 只监听 10 秒（自测用）
+./bin/bmsync watch --verify             # 自检：权限、文件指纹、监听参数
+```
+
+**它的工作方式**：每 5 秒检查一次两个书签文件的「大小 + mtime」，发现变化后等 3 秒确认浏览器写完了，再触发一次完整同步并记入日志。日志里能看到：
+
+```
+[2026-10-16 21:36:17] watch: Chrome 书签文件有变化，开始同步
+[2026-10-16 21:36:17] {"chrome_add": 0, ..., "safari_add": 1, ...}
+[2026-10-16 21:36:17] watch: 同步结束（退出码 0）
+```
+
+参数可以在 `config.json` 里调：
+
+```json
+"watch": {
+  "interval": 5.0,       // 轮询间隔（秒）
+  "settle": 3.0,         // 文件连续多久没变化才算写完了（秒）
+  "resync_after": 60.0   // 长时间无变化时也兜底同步一次（秒）
+}
+```
+
+**必须知道的限制**：浏览器把书签放在**内存**里，只在落盘时才写文件（Chrome 通常几秒到几十秒一次，Safari 类似）。所以"实时"的粒度是**浏览器保存书签的频率**，不是你点收藏的瞬间。这一点任何工具都绕不过去——文件没写出来，谁也读不到。
+
+其他行为：
+
+- 用 `flock` 保证**只有一个实例**在跑；已有实例时会拒绝启动（避免两个进程互相踩）
+- 同步时用 `--force`：即使浏览器开着也会写（浏览器退出时可能用内存数据覆盖，建议还是让它自己落盘后再同步）
+- 常驻服务带 `KeepAlive`，被系统杀掉或崩溃后会自动拉起（`ThrottleInterval` 10 秒防抖）
+- 服务日志在 `~/Library/Logs/bmsync/watch.{out,err}.log`，同步明细仍在 `state/bmsync.log`
+
+## 4. 定时同步
 
 ```bash
 ./bin/bmsync init-config                       # 先生成配置文件
@@ -155,7 +217,7 @@ launchctl start com.bmsync.sync
 
 > launchd/cron 拉起的进程同样受 TCC 限制：如果它报权限错误，需要把 `/usr/bin/python3` 单独加进"完全磁盘访问权限"。
 
-## 4. 它到底怎么判断"谁改了什么"
+## 5. 它到底怎么判断"谁改了什么"
 
 关键在于 `state/state.json` 里保存的**基线**（上次同步结束时的统一状态）。每次同步做三方比对：
 
@@ -172,7 +234,7 @@ launchctl start com.bmsync.sync
 
 **顺序不作为同步目标**——两个浏览器的排序机制不同，强行对齐只会每次都被判定成改动。内容与层级保证一致，顺序各自保留。
 
-## 5. 特别说明（重要）
+## 6. 特别说明（重要）
 
 - **首次同步会把两个浏览器的书签并成一份**（不推断删除，避免误删）。之后才进入增量模式。
 - **Chrome 的"移动设备书签"**：统一树里它就是 `其他书签/移动设备书签` 这个普通目录；写回 Chrome 时会还原到 `synced → Mobile bookmarks` 容器。若 Chrome 把书签直接挂在 `synced` 下，会被整理进 `Mobile bookmarks` 文件夹（保留原有 guid，只影响结构，不丢数据）。
@@ -182,7 +244,7 @@ launchctl start com.bmsync.sync
 - **写文件用"先写临时文件再替换"**，并在每次写入前把两边原文件备份进 `state/backups/`（默认保留 20 份）。
 - 只同步**书签**，不碰历史记录、扩展、密码等其他数据。
 
-## 6. 配置文件
+## 7. 配置文件
 
 `./bin/bmsync init-config` 会在仓库目录生成 `config.json`：
 
@@ -194,6 +256,12 @@ launchctl start com.bmsync.sync
   },
   "safari": {
     "bookmarks_path": "~/Library/Safari/Bookmarks.plist"
+  },
+  "mode": "manual",
+  "watch": {
+    "interval": 5.0,
+    "settle": 3.0,
+    "resync_after": 60.0
   },
   "sync": {
     "direction": "both",
@@ -207,6 +275,8 @@ launchctl start com.bmsync.sync
 }
 ```
 
+- `mode`：`manual` / `scheduled` / `watch`（用 `bmsync mode` 切换更省事）
+- `watch`：实时模式的节奏参数，见第 3 节
 - `direction`：`both` 双向；`chrome2safari` / `safari2chrome` 单向（只把源的变化应用到目标，目标自己的书签不受影响，冲突一律以源为准）
 - `prefer`：`newest`（默认，按修改时间）/ `chrome` / `safari`
 - 其他 Chromium 系浏览器（Edge、Brave、Vivaldi）改 `user_data_dir` 即可
@@ -217,7 +287,7 @@ launchctl start com.bmsync.sync
 ./bin/bmsync --config ~/bm-work.json sync
 ```
 
-## 7. 出问题时
+## 8. 出问题时
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
@@ -235,13 +305,13 @@ cp state/backups/chrome.20261016-195845.bak \
    ~/Library/Application\ Support/Google/Chrome/Default/Bookmarks
 ```
 
-## 8. 项目结构
+## 9. 项目结构
 
 ```
 bmsync/
 ├── bmsync.py                    # 全部实现，单文件，纯标准库
 ├── bin/bmsync                   # 启动器（可直接 ./bin/bmsync sync）
-├── tests/test_bmsync.py         # 79 项端到端测试
+├── tests/test_bmsync.py         # 97 项端到端测试
 ├── .github/
 │   ├── workflows/tests.yml      # CI：macOS 上跑测试 + lint
 │   └── ISSUE_TEMPLATE/          # Issue 模板（引导附带 doctor 输出）
@@ -254,7 +324,7 @@ bmsync/
     └── export/                  # export 命令的输出
 ```
 
-## 9. 开发与贡献
+## 10. 开发与贡献
 
 欢迎提 Issue 和 PR，见 [CONTRIBUTING.md](CONTRIBUTING.md)。跑测试：
 
@@ -273,12 +343,13 @@ pip install ruff
 ruff check .
 ```
 
-## 10. 已知限制
+## 11. 已知限制
 
-- 顺序不同步（理由见第 4 节）。
+- 顺序不同步（理由见第 5 节）。
 - Safari 里"收藏"和书签栏是同一份数据；在 Safari 收藏一个页面会同时出现在书签栏，反向同步时也会进 Chrome 书签栏，这符合预期。
 - 极短时间内的双向改动仍以时间戳判定，可能无法完全反映你的真实意图；脚本会把冲突列出来供你核对。
-- 没有实时监听（FSEvents）——设计目标是定时同步。真要实时，可以在 launchd 里用 `WatchPaths` 监听两个书签文件，但浏览器写盘频繁、容易抖动，一般不划算。
+- **实时模式的延迟取决于浏览器**：书签先写在内存里，落盘后才能被看到（见第 3 节）。真正的"零延迟"做不到。
+- 实时模式用轮询而非 FSEvents：浏览器是「写临时文件 + 原子替换」，路径级事件对这种方式不友好；mtime+size 轮询在各文件系统上都可靠，开销也可忽略（每秒不到 1ms）。
 - 只在 macOS 上有意义；Linux/Windows 上跑不起来（没有 Safari）。
 
 ## License

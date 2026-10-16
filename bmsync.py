@@ -39,6 +39,7 @@ import time
 import unicodedata
 import uuid
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from html import escape as html_escape
@@ -1251,6 +1252,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "safari": {
         "bookmarks_path": "~/Library/Safari/Bookmarks.plist",
     },
+    "mode": "manual",                 # manual | scheduled | watch（见 bmsync mode --help）
+    "watch": {
+        "interval": 5.0,              # 轮询间隔（秒）
+        "settle": 3.0,               # 文件连续多久没变化才算"写完了"（秒）
+        "resync_after": 60.0,         # 启动时/长时间无变化后，至少多久做一次兜底同步（秒）
+    },
     "sync": {
         "direction": "both",
         "prefer": "newest",
@@ -1265,6 +1272,40 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 def expand(path: Any) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(path))))
+
+
+def write_config_keys(path: Path, updates: Dict[str, Any]) -> None:
+    """把若干键合并写回配置文件（保留其它内容与未知键）。"""
+    data: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            data = {}
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(data.get(key), dict):
+            data[key].update(value)
+        else:
+            data[key] = value
+    atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+def config_target(cfg: Dict[str, Any], explicit: Optional[str]) -> Path:
+    """确定"模式"要写进哪个配置文件。"""
+    if explicit:
+        return expand(explicit)
+    return Path(cfg.get("_config_path") or (APP_DIR / "config.json"))
+
+
+def watch_settings(cfg: Dict[str, Any]) -> Dict[str, float]:
+    w = cfg.get("watch") or {}
+    def num(key: str, default: float, low: float = 0.1) -> float:
+        try:
+            return max(low, float(w.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+    return {"interval": num("interval", 5.0), "settle": num("settle", 3.0),
+            "resync_after": num("resync_after", 60.0)}
 
 
 def load_config(path: Optional[Path]) -> Dict[str, Any]:
@@ -1295,7 +1336,8 @@ def load_config(path: Optional[Path]) -> Dict[str, Any]:
 def state_paths(cfg: Dict[str, Any]) -> Dict[str, Path]:
     d = expand(cfg["state_dir"])
     return {"dir": d, "state": d / "state.json", "backups": d / "backups",
-            "log": expand(cfg.get("log_file") or (d / "bmsync.log"))}
+            "log": expand(cfg.get("log_file") or (d / "bmsync.log")),
+            "lock": d / "bmsync.lock", "watch_pid": d / "watch.pid"}
 
 
 def empty_state() -> Dict[str, Any]:
@@ -1341,6 +1383,30 @@ def save_state(sp: Dict[str, Path], state: Dict[str, Any], tree: Tree,
 def log_failure(sp: Dict[str, Path], reason: str, code: int) -> None:
     """把失败原因写进 bmsync.log。定时任务跑失败时这是唯一的线索。"""
     append_log(sp, ["[%s] 同步失败（退出码 %d）：%s" % (fmt_ts(now_ts()), code, reason)])
+
+
+@contextmanager
+def file_lock(path: Path, blocking: bool = False):
+    """基于 flock 的单实例锁。拿不到锁就抛 RuntimeError（非阻塞模式）。"""
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+        yield fh
+    except BlockingIOError:
+        raise RuntimeError("另一个 bmsync 实例正在运行（锁文件：%s）" % path)
+    finally:
+        try:
+            import fcntl as _f
+            _f.flock(fh.fileno(), _f.LOCK_UN)
+        except OSError:
+            pass
+        fh.close()
 
 
 def append_log(sp: Dict[str, Path], lines: Sequence[str]) -> None:
@@ -1645,8 +1711,9 @@ def cmd_doctor(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     print("\n[备份与定时]")
     print("  备份目录 : %s" % sp["backups"])
     print("  日志     : %s" % sp["log"])
-    installed = LAUNCHD_PATH.exists()
-    print("  定时任务 : %s" % ("已安装（%s）" % LAUNCHD_PATH if installed else "未安装（bmsync install-scheduler）"))
+    installed = launchd_plist_path(LAUNCHD_LABEL).exists()
+    print("  定时任务 : %s" % ("已安装（%s）" % launchd_plist_path(LAUNCHD_LABEL) if installed
+                               else "未安装（bmsync install-scheduler）"))
     print("-" * 70)
     print("结论：%s" % ("一切就绪，可以运行 bmsync sync" if ok else "存在权限问题，请按上面提示处理后再同步"))
     return 0 if ok else 2
@@ -1923,11 +1990,206 @@ def cmd_sync(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------------------
+# 实时同步（watch）
+# --------------------------------------------------------------------------------------
+
+
+def file_fingerprint(path: Path) -> Optional[Tuple[int, int]]:
+    """文件指纹：(大小, mtime 纳秒)。文件不存在返回 None。"""
+    try:
+        st = path.stat()
+        return (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def watch_fingerprints(backends: Sequence[Any]) -> Dict[str, Any]:
+    return {b.name: file_fingerprint(b.bookmarks_path) for b in backends}
+
+
+def watch_verify(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    """watch --verify：只做一次"有没有变化 + 能否同步"的检查，用来确认实时模式是否生效。"""
+    chrome, safari = build_backends(cfg)
+    sp = state_paths(cfg)
+    print("bmsync %s 实时同步自检" % __version__)
+    print("-" * 70)
+    for backend in (chrome, safari):
+        fp = file_fingerprint(backend.bookmarks_path)
+        readable, msg = check_readable(backend.bookmarks_path)
+        writable, msg_w = check_writable(backend.bookmarks_path)
+        print("[%s] %s" % (backend.label, backend.bookmarks_path))
+        print("  指纹  : %s" % ("大小 %s / mtime %s" % fp if fp else "文件不存在"))
+        print("  读取  : %s（%s）" % ("正常" if readable else "失败", msg))
+        print("  写入  : %s（%s）" % ("正常" if writable else "失败", msg_w))
+    w = watch_settings(cfg)
+    print("\n监听参数：轮询 %.1fs / 静默判定 %.1fs / 兜底同步 %.0fs" % (w["interval"], w["settle"], w["resync_after"]))
+    print("同步日志：%s" % sp["log"])
+    print("-" * 70)
+    print("结论：%s" % ("参数与权限就绪，可以运行 bmsync watch" if all(
+        check_readable(b.bookmarks_path)[0] and check_writable(b.bookmarks_path)[0] for b in (chrome, safari))
+        else "存在权限问题，先跑 bmsync doctor"))
+    return 0
+
+
+def watch_log(sp: Dict[str, Path], message: str, verbose: int) -> None:
+    """实时模式的运行日志：既写 bmsync.log，也按详细程度打到终端。"""
+    append_log(sp, ["[%s] watch: %s" % (fmt_ts(now_ts()), message)])
+    log("  %s" % message, verbose)
+
+
+def cmd_watch(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    """
+    实时同步：轮询两个书签文件，发现变化就触发一次同步。
+
+    为什么是轮询而不是 FSEvents：浏览器保存书签是「写临时文件 + 原子替换」，
+    路径级事件对这种方式不友好；mtime+size 轮询在所有文件系统上都可靠，
+    而且读取开销极小（每秒不到 1ms）。真正的限制在浏览器侧——它们把书签放在内存里，
+    退出时才整份写回，所以"实时"的粒度是浏览器落盘的频率。
+    """
+    if getattr(args, "verify", False):
+        return watch_verify(cfg, args)
+    if getattr(args, "stop", False):
+        return stop_watch_daemon(cfg, args)
+
+    verbose = getattr(args, "verbose", 1) or 0
+    chrome, safari = build_backends(cfg)
+    backends = (chrome, safari)
+    sp = state_paths(cfg)
+    w = watch_settings(cfg)
+    once = float(getattr(args, "once", 0) or 0)
+    lock_path = expand(getattr(args, "lock", None) or sp["lock"])
+
+    try:
+        with file_lock(lock_path):
+            pass
+    except RuntimeError as exc:
+        eprint("[错误] %s" % exc)
+        return 3
+
+    verbose_eff = verbose if once else 0      # 常驻模式默认不打刷屏汇总
+
+    for backend in backends:                   # 启动前先确认权限
+        readable, msg = check_readable(backend.bookmarks_path)
+        if not readable:
+            eprint("[错误] 无法读取 %s：%s" % (backend.label, msg))
+            eprint("       实时模式需要持续读取书签文件；先跑 bmsync doctor 处理权限。")
+            return 2
+        if not check_writable(backend.bookmarks_path)[0]:
+            eprint("[错误] 无法写入 %s：%s" % (backend.label, check_writable(backend.bookmarks_path)[1]))
+            return 2
+
+    if once:
+        log("实时同步自检（只跑一轮）", 1, verbose)
+    else:
+        print("bmsync 实时同步已启动")
+        print("  监听：%s" % "、".join(str(b.bookmarks_path) for b in backends))
+        print("  参数：轮询 %.1fs / 静默判定 %.1fs / 兜底同步 %.0fs"
+              % (w["interval"], w["settle"], w["resync_after"]))
+        print("  日志：%s" % sp["log"])
+        print("  退出：Ctrl+C（后台运行用 bmsync watch-daemon start）")
+        print("  提示：浏览器落盘前内存里的改动看不到，所以粒度取决于浏览器保存书签的频率。")
+        print("")
+    flush = True
+
+    # 启动时先做一次兜底同步（补上"上次同步之后、watch 启动之前"的变化）
+    if not getattr(args, "no_initial", False):
+        run_sync(cfg, chrome, safari, sp, load_state(sp),
+                 argparse.Namespace(dry_run=False, force=True, prefer=None, direction=None,
+                                    list_changes=False, max_show=0, quiet=False, json=False,
+                                    verbose=verbose_eff))
+        watch_log(sp, "启动时兜底同步完成", verbose)
+        flush = False
+    watch_log(sp, "开始监听（轮询 %.1fs）" % w["interval"], verbose)
+
+    # 变化检测状态：last_seen 是"已同步过的指纹"，pending 是"正在等待静默的那一份"。
+    # 注意 pending 必须和 raw_change 同为"变化的那部分"，否则两者永远不相等、计时器会被反复重置。
+    last_seen = watch_fingerprints(backends)
+    last_sync = now_ts()
+    settle_since: Optional[float] = None
+    pending: Optional[Dict[str, Any]] = None
+    watch_started = now_ts()
+
+    try:
+        with file_lock(lock_path):
+            while True:
+                time.sleep(w["interval"])
+                current = watch_fingerprints(backends)
+                raw_change = {name: fp for name, fp in current.items() if fp != last_seen.get(name)}
+
+                changed: Dict[str, Any] = {}
+                if raw_change:
+                    if raw_change != pending:
+                        # 文件刚被改动（或又改了）：重新开始静默计时
+                        pending = raw_change
+                        settle_since = now_ts()
+                        log("  检测到 %s 有写入，等待静默 %.1fs…"
+                            % ("、".join(raw_change), w["settle"]), 2, verbose)
+                    elif settle_since is not None and now_ts() - settle_since >= w["settle"]:
+                        # 连续 settle 秒没有再变化，认为浏览器写完了
+                        changed = raw_change
+                else:
+                    # 文件恢复原样（浏览器可能替换后又回退）
+                    if pending is not None:
+                        pending = None
+                        settle_since = None
+
+                if changed:
+                    who = "、".join({"chrome": "Chrome", "safari": "Safari"}.get(k, k) for k in changed)
+                    watch_log(sp, "%s 书签文件有变化，开始同步" % who, verbose)
+                    code = run_sync(cfg, chrome, safari, sp, load_state(sp),
+                                    argparse.Namespace(dry_run=False, force=True, prefer=None,
+                                                       direction=None, list_changes=False,
+                                                       max_show=0, quiet=True, json=False,
+                                                       verbose=verbose_eff))
+                    watch_log(sp, "同步结束（退出码 %d）" % code, verbose)
+                    last_sync = now_ts()
+                    settle_since, pending = None, None
+                    last_seen = watch_fingerprints(backends)   # 以写回后的状态为基准
+                    flush = True
+                else:
+                    # 长时间没有变化时也兜底同步一次（对齐"另一边被外部工具改动"等情况）
+                    if now_ts() - last_sync >= w["resync_after"]:
+                        run_sync(cfg, chrome, safari, sp, load_state(sp),
+                                 argparse.Namespace(dry_run=False, force=True, prefer=None,
+                                                    direction=None, list_changes=False, max_show=0,
+                                                    quiet=True, json=False, verbose=verbose_eff))
+                        watch_log(sp, "兜底同步完成（%.0fs 无变化）" % w["resync_after"], verbose)
+                        last_sync = now_ts()
+                        last_seen = watch_fingerprints(backends)
+
+                if flush:
+                    sys.stdout.flush()
+                    flush = False
+                if once and now_ts() - watch_started >= once:
+                    log("自检结束：已监听 %.1fs" % (now_ts() - watch_started), 1, verbose)
+                    return 0
+    except KeyboardInterrupt:
+        print("")
+        watch_log(sp, "实时同步已停止（Ctrl+C）", verbose)
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        # 常驻服务里异常退出会很难发现，这里务必留下记录
+        watch_log(sp, "实时同步异常退出：%s: %s" % (type(exc).__name__, exc), verbose)
+        eprint("[错误] 实时同步异常退出：%s: %s" % (type(exc).__name__, exc))
+        if verbose >= 2:
+            raise
+        return 1
+
+
+# --------------------------------------------------------------------------------------
 # 定时任务
 # --------------------------------------------------------------------------------------
 
+def launchd_dir() -> Path:
+    """
+    LaunchAgents 目录。默认 ~/Library/LaunchAgents；
+    可用环境变量 BMSYNC_LAUNCHD_DIR 覆盖（测试用，也方便放到非标准位置）。
+    """
+    override = os.environ.get("BMSYNC_LAUNCHD_DIR")
+    return expand(override) if override else (HOME / "Library/LaunchAgents")
+
+
 LAUNCHD_LABEL = "com.bmsync.sync"
-LAUNCHD_PATH = HOME / ("Library/LaunchAgents/%s.plist" % LAUNCHD_LABEL)
 # launchd 的 stdout/stderr 落在这里：~/Library/Logs 是系统认可的日志位置，launchd 必定可写。
 # 放在仓库的 state/ 下会有隐患——若仓库在外部卷或受保护目录，launchd 可能创建不了日志文件，
 # 于是任务失败时连一行线索都没有（表现为 .err.log 不存在）。
@@ -1996,28 +2258,28 @@ def cmd_install_scheduler(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     }
     data = plistlib.dumps(plist, fmt=plistlib.FMT_XML)
     if dry_run:
-        print("将写入：%s（每 %d 分钟一次）\n" % (LAUNCHD_PATH, interval // 60))
+        print("将写入：%s（每 %d 分钟一次）\n" % (launchd_plist_path(LAUNCHD_LABEL), interval // 60))
         print(data.decode("utf-8"))
         print("演练模式：未写入文件、未调用 launchctl。")
         return 0
-    LAUNCHD_PATH.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(LAUNCHD_PATH, data)
+    launchd_plist_path(LAUNCHD_LABEL).parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(launchd_plist_path(LAUNCHD_LABEL), data)
 
     # 必须先把旧定义从 launchd 内存里卸掉再装新的。只写文件不重新 bootstrap 的话，
     # 内存里留的还是上一份定义（可能指向已失效的解释器路径），表现为 `launchctl start`
     # 立刻失败、退出码 78（EX_CONFIG）、连日志文件都不会被创建。
     bootout = launchctl("bootout", "%s/%s" % (launchd_domain(), LAUNCHD_LABEL))
-    bootstrapped = launchctl("bootstrap", launchd_domain(), str(LAUNCHD_PATH))
+    bootstrapped = launchctl("bootstrap", launchd_domain(), str(launchd_plist_path(LAUNCHD_LABEL)))
     if bootstrapped.returncode != 0:
         # 老系统或特殊环境下的兜底：load -w 也能加载，但不如 bootstrap 可靠
-        legacy = launchctl("load", "-w", str(LAUNCHD_PATH))
+        legacy = launchctl("load", "-w", str(launchd_plist_path(LAUNCHD_LABEL)))
         if legacy.returncode != 0:
             eprint("加载定时任务失败。")
             eprint("  bootstrap: %s" % (bootstrapped.stderr.strip() or bootstrapped.stdout.strip()))
             eprint("  load     : %s" % (legacy.stderr.strip() or legacy.stdout.strip()))
-            eprint("请手动执行：launchctl bootstrap %s %s" % (launchd_domain(), LAUNCHD_PATH))
+            eprint("请手动执行：launchctl bootstrap %s %s" % (launchd_domain(), launchd_plist_path(LAUNCHD_LABEL)))
             return 1
-    print("已写入并加载定时任务：%s（每 %d 分钟一次）" % (LAUNCHD_PATH, interval // 60))
+    print("已写入并加载定时任务：%s（每 %d 分钟一次）" % (launchd_plist_path(LAUNCHD_LABEL), interval // 60))
     if bootout.returncode == 0:
         print("（已先卸载内存中的旧定义，避免残留旧配置）")
     del bootout
@@ -2069,12 +2331,214 @@ def cmd_install_scheduler(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
 
 def cmd_uninstall_scheduler(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     launchctl("bootout", "%s/%s" % (launchd_domain(), LAUNCHD_LABEL))
-    launchctl("unload", str(LAUNCHD_PATH))          # 兜底：老式加载方式的清理
-    if not LAUNCHD_PATH.exists():
+    launchctl("unload", str(launchd_plist_path(LAUNCHD_LABEL)))          # 兜底：老式加载方式的清理
+    if not launchd_plist_path(LAUNCHD_LABEL).exists():
         print("已卸载定时任务（未发现 plist 文件）。")
         return 0
-    LAUNCHD_PATH.unlink()
-    print("已移除 %s" % LAUNCHD_PATH)
+    try:
+        launchd_plist_path(LAUNCHD_LABEL).unlink()
+    except OSError as exc:
+        # 已从 launchd 卸载就算成功；删不掉 plist 只影响"下次登录是否还加载"，
+        # 不该让 mode 切换整个失败
+        eprint("警告：已从 launchd 卸载，但删除 plist 失败：%s（%s）" % (launchd_plist_path(LAUNCHD_LABEL), exc))
+        return 0
+    print("已移除 %s" % launchd_plist_path(LAUNCHD_LABEL))
+    return 0
+
+
+WATCH_LABEL = "com.bmsync.watch"
+
+
+def launchd_plist_path(label: str) -> Path:
+    return launchd_dir() / ("%s.plist" % label)
+
+
+def watch_daemon_plist(cfg: Dict[str, Any], args: argparse.Namespace, python: str) -> Dict[str, Any]:
+    script = Path(__file__).resolve()
+    log_dir = (expand(args.log_dir).resolve() if getattr(args, "log_dir", None) else LAUNCHD_LOG_DIR)
+    argv = [python, str(script)]
+    config_arg = str(Path(args.config).resolve()) if args.config else str(APP_DIR / "config.json")
+    if Path(config_arg).exists():
+        argv += ["--config", config_arg]
+    argv += ["watch", "--no-initial"]        # 常驻：启动时不做兜底同步，避免开机时抢跑
+    return {
+        "Label": WATCH_LABEL,
+        "ProgramArguments": argv,
+        "RunAtLoad": True,
+        "KeepAlive": True,                   # 崩了/被杀掉自动拉起
+        "ThrottleInterval": 10,
+        "StandardOutPath": str(log_dir / "watch.out.log"),
+        "StandardErrorPath": str(log_dir / "watch.err.log"),
+        "WorkingDirectory": str(APP_DIR),
+    }
+
+
+def watch_daemon_status() -> Tuple[bool, str]:
+    res = launchctl("print", "%s/%s" % (launchd_domain(), WATCH_LABEL))
+    if res.returncode != 0:
+        return False, "未运行"
+    pid = re.search(r"\bpid = (\d+)", res.stdout)
+    code = re.search(r"last exit code = (\d+)", res.stdout)
+    bits = []
+    if pid:
+        bits.append("PID %s" % pid.group(1))
+    if code:
+        bits.append("上次退出码 %s" % code.group(1))
+    return True, "运行中（%s）" % ("，".join(bits) if bits else "已加载")
+
+
+def start_watch_daemon(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    python = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else (sys.executable or "python3")
+    blockers = []
+    for backend in build_backends(cfg):
+        if not check_readable(backend.bookmarks_path)[0]:
+            blockers.append("%s 读取失败" % backend.label)
+        elif not check_writable(backend.bookmarks_path)[0]:
+            blockers.append("%s 写入失败" % backend.label)
+    if blockers:
+        eprint("未启动常驻监听：%s" % "；".join(blockers))
+        eprint("  先跑 bmsync doctor 处理权限（launchd 需要单独授予完全磁盘访问权限）。")
+        return 2
+    log_dir = (expand(args.log_dir).resolve() if getattr(args, "log_dir", None) else LAUNCHD_LOG_DIR)
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        eprint("无法创建日志目录 %s：%s" % (log_dir, exc))
+        return 1
+    data = plistlib.dumps(watch_daemon_plist(cfg, args, python), fmt=plistlib.FMT_XML)
+    if getattr(args, "dry_run", False):
+        print("将写入：%s\n" % launchd_plist_path(WATCH_LABEL))
+        print(data.decode("utf-8"))
+        print("演练模式：未写入、未调用 launchctl。")
+        return 0
+    launchd_plist_path(WATCH_LABEL).parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(launchd_plist_path(WATCH_LABEL), data)
+    launchctl("bootout", "%s/%s" % (launchd_domain(), WATCH_LABEL))
+    res = launchctl("bootstrap", launchd_domain(), str(launchd_plist_path(WATCH_LABEL)))
+    if res.returncode != 0:
+        legacy = launchctl("load", "-w", str(launchd_plist_path(WATCH_LABEL)))
+        if legacy.returncode != 0:
+            eprint("启动失败：%s" % (res.stderr.strip() or legacy.stderr.strip()))
+            return 1
+    set_mode(cfg, args, "watch", quiet=True)
+    print("实时监听已作为常驻服务启动：%s" % launchd_plist_path(WATCH_LABEL))
+    print("  它会在登录后自动启动，退出后自动拉起（KeepAlive）。")
+    print("  查看状态：bmsync watch-daemon status")
+    print("  查看输出：%s" % (log_dir / "watch.err.log"))
+    print("  停止    ：bmsync watch-daemon stop")
+    return 0
+
+
+def stop_watch_daemon(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    existed = launchd_plist_path(WATCH_LABEL).exists()
+    launchctl("bootout", "%s/%s" % (launchd_domain(), WATCH_LABEL))
+    launchctl("unload", str(launchd_plist_path(WATCH_LABEL)))
+    if existed and not getattr(args, "keep_plist", False):
+        launchd_plist_path(WATCH_LABEL).unlink()
+    print("已停止实时监听服务（%s）" % ("并移除 plist" if existed else "未发现 plist，仅确保已卸载"))
+    return 0
+
+
+def cmd_watch_daemon(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    action = args.action
+    if action == "start":
+        return start_watch_daemon(cfg, args)
+    if action == "stop":
+        return stop_watch_daemon(cfg, args)
+    if action == "restart":
+        stop_watch_daemon(cfg, argparse.Namespace(**{**vars(args), "keep_plist": True}))
+        return start_watch_daemon(cfg, args)
+    # status
+    running, desc = watch_daemon_status()
+    sp = state_paths(cfg)
+    mode = (cfg.get("mode") or "manual")
+    w = watch_settings(cfg)
+    print("bmsync 实时监听服务")
+    print("-" * 70)
+    print("服务状态 : %s" % desc)
+    print("plist    : %s%s" % (launchd_plist_path(WATCH_LABEL),
+                               "" if launchd_plist_path(WATCH_LABEL).exists() else "（不存在）"))
+    print("当前模式 : %s" % mode)
+    print("监听参数 : 轮询 %.1fs / 静默 %.1fs / 兜底 %.0fs" % (w["interval"], w["settle"], w["resync_after"]))
+    print("同步日志 : %s" % sp["log"])
+    print("服务日志 : %s" % (LAUNCHD_LOG_DIR / "watch.err.log"))
+    if not running:
+        print("\n启动：bmsync watch-daemon start    （或前台运行观察：bmsync watch）")
+    return 0 if running else 1
+
+
+MODE_LABELS = {
+    "manual": "手动：不自动同步，需要时自己跑 bmsync sync",
+    "scheduled": "定时：由 launchd 每 N 分钟同步一次（bmsync install-scheduler）",
+    "watch": "实时：常驻监听书签文件，一变就同步（bmsync watch / watch-daemon start）",
+}
+
+
+def set_mode(cfg: Dict[str, Any], args: argparse.Namespace, mode: str, quiet: bool = False) -> None:
+    target = config_target(cfg, getattr(args, "config", None))
+    write_config_keys(target, {"mode": mode})
+    cfg["mode"] = mode
+    if not quiet:
+        print("工作模式已设为：%s —— %s" % (mode, MODE_LABELS.get(mode, "")))
+        print("配置写入：%s" % target)
+
+
+def cmd_mode(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    """查看或切换工作模式，并把另一种自动方式清理掉，避免两套机制互相打架。"""
+    if not args.mode:
+        mode = cfg.get("mode") or "manual"
+        print("bmsync 工作模式")
+        print("-" * 70)
+        for key, label in MODE_LABELS.items():
+            print("  %s %-10s %s" % ("→" if key == mode else " ", key, label))
+        print("\n当前：%s" % mode)
+        sched = launchd_plist_path(LAUNCHD_LABEL).exists()
+        running, desc = watch_daemon_status() if launchd_plist_path(WATCH_LABEL).exists() else (False, "未安装")
+        print("  定时任务  : %s" % ("已安装" if sched else "未安装"))
+        print("  常驻监听  : %s" % desc)
+        if (mode == "scheduled" and not sched) or (mode == "watch" and not running):
+            print("\n注意：模式与已安装的服务不一致，按下面提示补齐即可。")
+        print("\n切换：bmsync mode manual | scheduled | watch")
+        return 0
+
+    mode = args.mode
+    if mode == "manual":
+        set_mode(cfg, args, mode)
+        stopped = []
+        if launchd_plist_path(LAUNCHD_LABEL).exists():
+            try:
+                cmd_uninstall_scheduler(cfg, args)
+                stopped.append("定时任务")
+            except OSError as exc:
+                eprint("警告：移除定时任务时出错（不影响模式设置）：%s" % exc)
+        if launchd_plist_path(WATCH_LABEL).exists():
+            try:
+                stop_watch_daemon(cfg, args)
+                stopped.append("常驻监听")
+            except OSError as exc:
+                eprint("警告：停止常驻监听时出错（不影响模式设置）：%s" % exc)
+        print("已停止自动同步%s。" % ("（%s）" % "、".join(stopped) if stopped else ""))
+        return 0
+    if mode == "scheduled":
+        set_mode(cfg, args, mode)
+        if launchd_plist_path(WATCH_LABEL).exists():
+            try:
+                stop_watch_daemon(cfg, args)
+                print("已停止常驻监听，避免两套机制同时写书签。")
+            except OSError as exc:
+                eprint("警告：停止常驻监听时出错（不影响模式设置）：%s" % exc)
+        print("接下来运行：bmsync install-scheduler --interval 60")
+        return 0
+    # watch
+    set_mode(cfg, args, mode)
+    if launchd_plist_path(LAUNCHD_LABEL).exists():
+        print("检测到已安装定时任务：两者同时运行会重复写书签，建议二选一。")
+        if not getattr(args, "keep_scheduler", False):
+            cmd_uninstall_scheduler(cfg, args)
+            print("已自动移除定时任务（想保留请加 --keep-scheduler）。")
+    print("接下来二选一：")
+    print("  前台观察：bmsync watch                （Ctrl+C 退出）")
+    print("  后台常驻：bmsync watch-daemon start   （登录自启、掉线自动拉起）")
     return 0
 
 
@@ -2194,6 +2658,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init_config)
+
+    p = new_sub("watch", help="实时同步：监听书签文件变化并自动同步")
+    p.add_argument("--once", type=float, metavar="秒", help="跑指定秒数后退出（用于自测）")
+    p.add_argument("--verify", action="store_true", help="只自检一次：权限、指纹、参数")
+    p.add_argument("--stop", action="store_true", help="停止常驻监听服务")
+    p.add_argument("--no-initial", action="store_true", help="启动时不做兜底同步")
+    p.add_argument("--lock", help="锁文件路径（默认 state/bmsync.lock）")
+    p.set_defaults(func=cmd_watch)
+
+    p = new_sub("watch-daemon", help="把实时同步装成常驻服务（登录自启、掉线拉起）")
+    p.add_argument("action", nargs="?", choices=["status", "start", "stop", "restart"], default="status")
+    p.add_argument("--log-dir", help="服务日志目录（默认 ~/Library/Logs/bmsync）")
+    p.add_argument("--dry-run", "-n", action="store_true", help="只打印将要写入的 plist")
+    p.add_argument("--keep-plist", action="store_true", help="stop 时保留 plist 文件")
+    p.set_defaults(func=cmd_watch_daemon)
+
+    p = new_sub("mode", help="查看/切换工作模式：manual | scheduled | watch")
+    p.add_argument("mode", nargs="?", choices=["manual", "scheduled", "watch"], help="留空则只显示当前模式")
+    p.add_argument("--keep-scheduler", action="store_true", help="切到 watch 时保留已安装的定时任务")
+    p.set_defaults(func=cmd_mode)
 
     p = new_sub("install-scheduler", help="安装 launchd 定时同步任务")
     p.add_argument("--interval", type=int, default=60, help="间隔分钟（默认 60，最小 5）")

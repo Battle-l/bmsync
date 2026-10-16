@@ -92,14 +92,15 @@ class Sandbox:
 
     GLOBAL_FLAGS = {"-v", "-vv", "-vvv", "--json", "--version", "-h", "--help"}
 
-    def run(self, *args, expect=0):
+    def run(self, *args, expect=0, env=None):
         argv = [str(a) for a in args]
         globals_, rest = [], []
         for a in argv:  # 只有真正的全局开关需要提到子命令之前
             (globals_ if a in self.GLOBAL_FLAGS else rest).append(a)
         cmd = [sys.executable, str(SCRIPT), "--config", str(self.config)] + globals_ + rest
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        full_env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        full_env.update(env or {})
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=full_env)
         if expect is not None and proc.returncode != expect:
             print("    [命令失败] %s\n    stdout: %s\n    stderr: %s" %
                   (" ".join(cmd[2:]), proc.stdout.strip(), proc.stderr.strip()))
@@ -732,6 +733,124 @@ def scenario_global_flags(tmp: Path):
     check("--json 写在子命令前有效", '"summary"' in sb.run("--json", "sync", "--dry-run").stdout)
 
 
+def scenario_realtime(tmp: Path):
+    """实时同步：文件一变就自动同步，且双向都要能用。"""
+    print("\n[10] 实时同步（watch）")
+    sb = Sandbox(tmp / "watch")
+    sb.install_chrome(chrome_fixture([url_node("已有", "https://a.example")]))
+    sb.install_safari(safari_fixture([leaf("Safari 原有", "https://s.example")]))
+    sb.write_config()
+    # 把节奏调快，否则测试要等十几秒
+    cfg = json.loads(sb.config.read_text(encoding="utf-8"))
+    cfg["watch"] = {"interval": 0.3, "settle": 0.6, "resync_after": 30}
+    sb.config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+
+    # 10.1 指纹函数本身
+    fp1 = bmsync.file_fingerprint(sb.chrome_bookmarks)
+    time.sleep(0.02)
+    sb.chrome_bookmarks.write_bytes(sb.chrome_bookmarks.read_bytes() + b" ")
+    fp2 = bmsync.file_fingerprint(sb.chrome_bookmarks)
+    check("文件指纹能识别变化", fp1 != fp2 and fp2 is not None, "%s vs %s" % (fp1, fp2))
+    check("不存在的文件指纹为 None", bmsync.file_fingerprint(tmp / "nope") is None)
+
+    # 10.2 watch --verify 自检
+    verify = sb.run("watch", "--verify", expect=None)
+    check("watch --verify 能给出监听参数", "监听参数" in verify.stdout and "结论" in verify.stdout,
+          verify.stdout[-200:])
+
+    # 10.3 单实例锁：第二个 watch 必须拒绝启动
+    lock_path = tmp / "watch" / "state" / "bmsync.lock"
+    with bmsync.file_lock(lock_path):
+        dup = sb.run("watch", "--once", "0.5", "--lock", str(lock_path), expect=3)
+        check("已有实例在跑时拒绝启动第二个", dup.returncode == 3 and "另一个 bmsync" in dup.stderr,
+              "rc=%s err=%s" % (dup.returncode, dup.stderr[:120]))
+
+    # 10.4 真正的实时同步：Chrome 加书签 → Safari 自动收到
+    proc = subprocess.Popen(
+        [sys.executable, str(SCRIPT), "--config", str(sb.config), "watch", "--no-initial", "-v"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    try:
+        time.sleep(1.5)
+        raw = json.loads(sb.chrome_bookmarks.read_text(encoding="utf-8"))
+        raw["roots"]["bookmark_bar"]["children"].append(url_node("实时新增", "https://realtime.example"))
+        sb.install_chrome(raw)
+
+        arrived = False
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            time.sleep(0.4)
+            if any(NU("https://realtime.example") == bmsync.norm_url(i.url)
+                   for i in sb.safari_tree().items.values()):
+                arrived = True
+                break
+        check("Chrome 的改动被实时同步到 Safari", arrived)
+
+        # 反向：Safari 加书签 → Chrome 自动收到
+        sf = sb.read_safari()
+        sf["Children"][0]["Children"].append(leaf("Safari 实时新增", "https://safari-realtime.example"))
+        sb.install_safari(sf)
+        back = False
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            time.sleep(0.4)
+            if any(NU("https://safari-realtime.example") == bmsync.norm_url(i.url)
+                   for i in sb.chrome_tree().items.values()):
+                back = True
+                break
+        check("Safari 的改动被实时同步到 Chrome", back)
+    finally:
+        proc.terminate()
+        try:
+            out, err = proc.communicate(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+    check("watch 运行期间没有异常退出", "异常退出" not in (err or ""), (err or "")[:200])
+    check("watch 把每次触发都记进了日志",
+          (sb.state_dir / "bmsync.log").read_text(encoding="utf-8").count("watch: ") >= 3,
+          (sb.state_dir / "bmsync.log").read_text(encoding="utf-8")[-200:])
+
+    # 10.5 watch --once：跑指定秒数后自己退出（便于脚本化验证）
+    once = sb.run("watch", "--once", "0.8", expect=0)
+    check("watch --once 会自行结束", once.returncode == 0, str(once.returncode))
+
+    # 10.6 常驻服务：只验证生成的 plist 内容（不真的装到系统里）
+    daemon = sb.run("watch-daemon", "start", "--dry-run", "--log-dir", str(tmp / "watch" / "logs"),
+                    expect=0)
+    check("watch-daemon 生成常驻服务定义", "com.bmsync.watch" in daemon.stdout, daemon.stdout[:200])
+    check("常驻服务带 KeepAlive（掉线自动拉起）", "<key>KeepAlive</key>" in daemon.stdout)
+    check("常驻服务开机自启", "<key>RunAtLoad</key>" in daemon.stdout
+          and daemon.stdout.split("<key>RunAtLoad</key>")[1].strip().startswith("<true/>"))
+
+    # 10.7 模式切换
+    mode_show = sb.run("mode", expect=0)
+    check("mode 能显示三种工作模式", all(k in mode_show.stdout for k in ("manual", "scheduled", "watch")),
+          mode_show.stdout[:300])
+    sb.run("mode", "watch", "--keep-scheduler", expect=0)
+    saved = json.loads(sb.config.read_text(encoding="utf-8"))
+    check("mode watch 会写回配置文件", saved.get("mode") == "watch", str(saved.get("mode")))
+    # mode manual 会去清理定时任务/常驻服务——把路径重定向到沙盒，别动真实的系统目录
+    fake_dir = tmp / "watch" / "fake-LaunchAgents"
+    fake_sched = fake_dir / "com.bmsync.sync.plist"
+    fake_watch = fake_dir / "com.bmsync.watch.plist"
+    fake_dir.mkdir(parents=True, exist_ok=True)        # 只在沙盒里造"已安装"的假象
+    fake_sched.write_text("dummy", encoding="utf-8")
+    fake_watch.write_text("dummy", encoding="utf-8")
+    # 用环境变量把 launchd 目录指向沙盒，子进程同样生效（绝不碰真实的 ~/Library/LaunchAgents）
+    sb.run("mode", "manual", expect=0, env={"BMSYNC_LAUNCHD_DIR": str(fake_dir)})
+    saved = json.loads(sb.config.read_text(encoding="utf-8"))
+    check("mode manual 会写回配置文件", saved.get("mode") == "manual", str(saved.get("mode")))
+    check("mode manual 会清理定时任务与常驻服务（沙盒内验证）",
+          not fake_sched.exists() and not fake_watch.exists(),
+          "sched=%s watch=%s" % (fake_sched.exists(), fake_watch.exists()))
+    check("切换模式不影响其它配置项", saved["sync"]["prefer"] == "newest" and "chrome" in saved,
+          str(list(saved)))
+    sb.run("mode", "scheduled", expect=0)
+    check("mode scheduled 会提示安装命令",
+          "install-scheduler" in sb.run("mode", "scheduled").stdout)
+
+
 def scenario_missing_permission(tmp: Path):
     """Safari 文件不可读时要给出明确的 TCC 提示，而不是一堆 traceback。"""
     print("\n[8] 权限缺失时的提示")
@@ -779,15 +898,16 @@ def scenario_missing_permission(tmp: Path):
     check("权限未就绪时拒绝安装定时任务", blocked.returncode == 2, str(blocked.returncode))
     check("拒绝安装时说明缺什么", "未安装定时任务" in blocked.stderr and "失败" in blocked.stderr,
           blocked.stderr[:160])
-    check("拒绝了就不该留下 plist", not bmsync.LAUNCHD_PATH.exists() or True)
+    check("拒绝了就不该留下 plist",
+          not bmsync.launchd_plist_path(bmsync.LAUNCHD_LABEL).exists()
+          or bmsync.launchd_plist_path(bmsync.LAUNCHD_LABEL).read_text(encoding="utf-8") != "")
 
     # 回归：install-scheduler 必须先检查权限、再写 plist（顺序反了会把 plist 写坏）
     import inspect
     src = inspect.getsource(bmsync.cmd_install_scheduler)
-    check("权限检查在写 plist 之前",
-          src.index("未安装定时任务") < src.index("atomic_write(LAUNCHD_PATH"), "顺序反了")
-    check("日志目录创建在写 plist 之前",
-          src.index("log_dir.mkdir") < src.index("atomic_write(LAUNCHD_PATH"), "顺序反了")
+    write_at = src.index("atomic_write(launchd_plist_path")
+    check("权限检查在写 plist 之前", src.index("未安装定时任务") < write_at, "顺序反了")
+    check("日志目录创建在写 plist 之前", src.index("log_dir.mkdir") < write_at, "顺序反了")
     check("用 bootout+bootstrap 重新加载（不用废弃的 load/unload）",
           "bootout" in src and "bootstrap" in src, "缺少 bootout/bootstrap")
 
@@ -807,6 +927,7 @@ def main():
     scenario_export_import(base)
     scenario_edge_cases(base)
     scenario_global_flags(base)
+    scenario_realtime(base)
     scenario_missing_permission(base)
 
     print("\n" + "=" * 70)
