@@ -815,6 +815,21 @@ def scenario_realtime(tmp: Path):
     once = sb.run("watch", "--once", "0.8", expect=0)
     check("watch --once 会自行结束", once.returncode == 0, str(once.returncode))
 
+    # 10.55 浏览器在跑时的风险提示（实时模式没法"拒绝同步"，但必须说清覆盖风险）
+    if bmsync.is_process_running(["python3", "python3.14", "python"]) is None:
+        print("  ⤵ 进程检测不可用（沙盒里 ps 被禁用），跳过这两项——在你自己的终端里会执行")
+    else:
+        check("进程检测能认出正在运行的程序",
+              bmsync.is_process_running(["python3", "python3.14", "python"]) is not None)
+        check("进程检测对不存在的名字返回 None",
+              bmsync.is_process_running(["definitely-not-running-xyz"]) is None)
+    import inspect as _inspect
+    wsrc = _inspect.getsource(bmsync.cmd_watch)
+    check("watch 会提示「浏览器运行中可能覆盖」的风险",
+          "正在运行" in wsrc and "覆盖" in wsrc, "缺少风险提示")
+    check("watch --verify 也会给出该风险提示",
+          "正在运行" in _inspect.getsource(bmsync.watch_verify))
+
     # 10.6 常驻服务：只验证生成的 plist 内容（不真的装到系统里）
     daemon = sb.run("watch-daemon", "start", "--dry-run", "--log-dir", str(tmp / "watch" / "logs"),
                     expect=0)

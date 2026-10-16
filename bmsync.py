@@ -2023,6 +2023,14 @@ def watch_verify(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
         print("  写入  : %s（%s）" % ("正常" if writable else "失败", msg_w))
     w = watch_settings(cfg)
     print("\n监听参数：轮询 %.1fs / 静默判定 %.1fs / 兜底同步 %.0fs" % (w["interval"], w["settle"], w["resync_after"]))
+    if cfg["sync"].get("require_browsers_closed", True):
+        running = [b.label for b in (chrome, safari)
+                   if is_process_running(CHROMIUM_PROCS if b is chrome else ["Safari"])]
+        if running:
+            print("⚠️ %s 正在运行。浏览器把书签放在内存里，会整份重写书签文件，"
+                  "本工具写进去的内容可能被覆盖；" % "、".join(running))
+            print("   双向都可靠的做法：退出浏览器 → 触发一次同步 → 再打开。")
+            print("   （这一提示来自 require_browsers_closed=true，可在 config.json 里关掉）")
     print("同步日志：%s" % sp["log"])
     print("-" * 70)
     print("结论：%s" % ("参数与权限就绪，可以运行 bmsync watch" if all(
@@ -2136,6 +2144,15 @@ def cmd_watch(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
                 if changed:
                     who = "、".join({"chrome": "Chrome", "safari": "Safari"}.get(k, k) for k in changed)
                     watch_log(sp, "%s 书签文件有变化，开始同步" % who, verbose)
+                    if cfg["sync"].get("require_browsers_closed", True):
+                        # 实时模式下没法"拒绝同步"，但必须说清风险：运行中的浏览器
+                        # 把书签放在内存里，随时可能整份重写文件、覆盖掉我们写进去的内容
+                        running = [b.label for b in backends
+                                   if is_process_running(CHROMIUM_PROCS if b is chrome else ["Safari"])]
+                        if running:
+                            watch_log(sp, "⚠️ %s 正在运行：写入的内容可能被它用内存数据覆盖。"
+                                          "让变更可靠落地的做法是退出浏览器后再同步（改 "
+                                          "require_browsers_closed 可关闭此提示）" % "、".join(running), verbose)
                     code = run_sync(cfg, chrome, safari, sp, load_state(sp),
                                     argparse.Namespace(dry_run=False, force=True, prefer=None,
                                                        direction=None, list_changes=False,
