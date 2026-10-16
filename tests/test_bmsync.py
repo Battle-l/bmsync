@@ -888,6 +888,33 @@ def scenario_realtime(tmp: Path):
             proc.kill()
             proc.communicate()
 
+    # 10.54 watch --why：能区分"文件被重写"与"内容真的变了"
+    why_sb = Sandbox(tmp / "watch" / "why")
+    why_sb.install_chrome(chrome_fixture([url_node("A", "https://a.example")]))
+    why_sb.install_safari(safari_fixture([leaf("B", "https://b.example")]))
+    why_sb.write_config()
+    proc = subprocess.Popen(
+        [sys.executable, str(SCRIPT), "--config", str(why_sb.config), "watch", "--why", "4"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    time.sleep(1.2)
+    raw = json.loads(why_sb.chrome_bookmarks.read_text(encoding="utf-8"))
+    raw["checksum"] = "b" * 32                      # 只改易变字段
+    why_sb.chrome_bookmarks.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    time.sleep(1.2)
+    raw = json.loads(why_sb.chrome_bookmarks.read_text(encoding="utf-8"))
+    raw["roots"]["bookmark_bar"]["children"].append(url_node("真新增", "https://why-new.example"))
+    why_sb.chrome_bookmarks.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    try:
+        out, _err = proc.communicate(timeout=25)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, _err = proc.communicate()
+    check("watch --why 能识别纯噪音重写", "内容未变（噪音）" in out, out[-300:])
+    check("watch --why 能识别真实内容变化并给出差异", "内容也变了" in out and "差异：" in out,
+          out[-400:])
+    check("watch --why 给出结论", "结论：" in out, out[-200:])
+
     # 10.55 浏览器在跑时的风险提示（实时模式没法"拒绝同步"，但必须说清覆盖风险）
     if bmsync.is_process_running(["python3", "python3.14", "python"]) is None:
         print("  ⤵ 进程检测不可用（沙盒里 ps 被禁用），跳过这两项——在你自己的终端里会执行")

@@ -120,12 +120,23 @@ Safari 的书签文件受 macOS 的 TCC 保护，`chmod`、`sudo` 都没用，�
 ./bin/bmsync watch-daemon stop          # 停止并移除
 ./bin/bmsync watch --once 10            # 只监听 10 秒（自测用）
 ./bin/bmsync watch --verify             # 自检：权限、文件指纹、监听参数
+./bin/bmsync watch --why 60             # 观察 60 秒：文件被重写时书签内容是否真的变了
 ```
+
+**排查"我没动书签，为什么一直提示写入"**：
+
+```bash
+./bin/bmsync watch --why 60
+```
+
+它会盯着两个文件 60 秒，每次文件被重写就报告是"内容未变（噪音）"还是"内容也变了"，后者还会列出**具体哪个字段变了**。把差异发出来即可把该字段加入忽略列表。
 
 **它的工作方式**：每 5 秒检查一次两个书签文件，**只有书签的实质内容变了才同步**：
 
 1. `大小 + mtime` 变了 → 说明文件被重写过（浏览器切标签页、Chrome 更新 checksum、系统重写 plist 都会这样）
-2. 再比对**实质内容指纹**（忽略 `checksum`、`date_last_used`、`WebBookmarkModificationDate` 等易变字段）
+2. 再比对**实质内容指纹**：只算"用户看得见的内容"（URL、标题、层级、容器类型），
+   忽略 `checksum`、`date_last_used`、`date_added`、`WebBookmarkModificationDate`、
+   `WebBookmarkSyncData`，以及 Safari 内部会被重新分配的 `WebBookmarkUUID` / `WebBookmarkSpecialID`
 3. 内容确实变了 → 等 `settle` 秒确认浏览器写完（避免读到写了一半的文件）→ 触发一次完整同步
 4. 内容没变 → 静默跳过，只在 `-vv` 下留一行"跳过同步（累计 N 次）"
 

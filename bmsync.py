@@ -1508,9 +1508,11 @@ VOLATILE_KEYS = frozenset({
     "WebBookmarkSyncBlob", "WebBookmarkTitleLastModified",
 })
 
-# 只对这些字段算指纹：它们才代表"书签的结构与内容"
-CONTENT_KEYS = ("WebBookmarkType", "WebBookmarkUUID", "WebBookmarkSpecialID",
-                "URLString", "Title", "URIDictionary", "Children", "type", "url", "name", "roots")
+# 只对这些字段算指纹：它们才是"用户看得见的内容"。
+# 刻意排除 WebBookmarkUUID / WebBookmarkSpecialID —— 它们是 Safari 的内部标识，
+# 会被系统重写时重新分配，但不代表书签内容有任何变化。
+CONTENT_KEYS = ("WebBookmarkType", "URLString", "Title", "URIDictionary",
+                "Children", "type", "url", "name", "roots")
 
 
 def _strip_volatile(obj: Any) -> Any:
@@ -1554,6 +1556,43 @@ def _plist_content(node: Any) -> Any:
     if isinstance(node, (list, tuple)):
         return [_plist_content(v) for v in node]
     return node
+
+
+def content_diff(old: Any, new: Any, path: str = "", out: Optional[List[str]] = None,
+                 limit: int = 40) -> List[str]:
+    """比较两份"已剥离易变字段"的内容，列出差异位置。用于诊断"到底什么在变"。"""
+    out = out if out is not None else []
+    if len(out) >= limit:
+        return out
+    if type(old) is not type(new):
+        out.append("%s: 类型变化 %s → %s" % (path or "/", type(old).__name__, type(new).__name__))
+        return out
+    if isinstance(old, dict):
+        for key in sorted(set(old) | set(new)):
+            if key not in old:
+                out.append("%s/%s: 新增" % (path, key))
+            elif key not in new:
+                out.append("%s/%s: 消失" % (path, key))
+            else:
+                content_diff(old[key], new[key], "%s/%s" % (path, key), out, limit)
+    elif isinstance(old, list):
+        if len(old) != len(new):
+            out.append("%s: 数量 %d → %d" % (path or "/", len(old), len(new)))
+        for i in range(min(len(old), len(new))):
+            content_diff(old[i], new[i], "%s[%d]" % (path, i), out, limit)
+    elif old != new:
+        out.append("%s: %r → %r" % (path or "/", str(old)[:60], str(new)[:60]))
+    return out
+
+
+def normalized_content(data: bytes) -> Any:
+    """把原始字节归约成"只含内容字段"的结构（JSON 或 plist 都能处理）。"""
+    try:
+        obj = json.loads(data.decode("utf-8"))
+        return _strip_volatile(obj) if isinstance(obj, dict) and "roots" in obj else obj
+    except (ValueError, UnicodeDecodeError):
+        obj = plistlib.loads(data)
+        return _plist_content(obj) if isinstance(obj, dict) and "Children" in obj else obj
 
 
 def file_content_fingerprint(path: Path, cache: Optional[Dict[str, Any]] = None) -> Optional[str]:
@@ -2444,6 +2483,68 @@ def watch_verify(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_watch_why(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    """
+    watch --why：盯住两个书签文件一段时间，报告"文件变了但内容是否真的变了"。
+    用来定位"我没动书签，为什么一直提示写入"。
+    """
+    chrome, safari = build_backends(cfg)
+    backends = (chrome, safari)
+    seconds = float(getattr(args, "why", 0) or 60)
+    print("bmsync %s 观察模式：盯 %s 书签文件 %.0f 秒" % (__version__, "两个", seconds))
+    print("期间请不要增删书签，正常浏览即可。")
+    print("-" * 70)
+    cache: Dict[str, Any] = {}
+    last_stat = watch_fingerprints(backends)
+    last_content = {b.name: file_content_fingerprint(b.bookmarks_path, cache) for b in backends}
+    last_norm = {}
+    for b in backends:
+        try:
+            last_norm[b.name] = normalized_content(b.bookmarks_path.read_bytes())
+        except OSError:
+            last_norm[b.name] = None
+    events: Dict[str, int] = {"stat": 0, "content": 0}
+    started = now_ts()
+    while now_ts() - started < seconds:
+        time.sleep(1.0)
+        current = watch_fingerprints(backends)
+        for backend in backends:
+            name = backend.name
+            if current.get(name) == last_stat.get(name):
+                continue
+            events["stat"] += 1
+            digest = file_content_fingerprint(backend.bookmarks_path, cache)
+            tag = "内容也变了 ⚠" if digest != last_content.get(name) else "内容未变（噪音）"
+            print("[%s] %-6s 文件被重写 → %s" % (fmt_ts(now_ts())[-8:], backend.label, tag))
+            if digest != last_content.get(name):
+                events["content"] += 1
+                try:
+                    now_norm = normalized_content(backend.bookmarks_path.read_bytes())
+                except OSError:
+                    now_norm = None
+                diffs = content_diff(last_norm.get(name), now_norm) if last_norm.get(name) is not None else []
+                for line in diffs[:12]:
+                    print("       差异：%s" % line)
+                if len(diffs) > 12:
+                    print("       （其余 %d 处省略）" % (len(diffs) - 12))
+                if not diffs:
+                    print("       未发现内容字段差异（可能只是顺序/结构重排）")
+                last_norm[name] = now_norm
+                last_content[name] = digest
+        last_stat = current
+    print("-" * 70)
+    print("观察 %.0f 秒：文件被重写 %d 次，其中内容真的变化 %d 次"
+          % (seconds, events["stat"], events["content"]))
+    if events["stat"] and not events["content"]:
+        print("结论：只是浏览器在重写文件，书签内容没有变化 —— 实时同步不会因此触发。")
+    elif events["content"]:
+        print("结论：上面的『差异』就是让实时同步触发的字段。请把它发给我，"
+              "我把这些字段加入忽略列表（它们应当属于易变元数据）。")
+    else:
+        print("结论：这段时间文件没有任何写入。")
+    return 0
+
+
 def watch_log(sp: Dict[str, Path], message: str, verbose: int) -> None:
     """实时模式的运行日志：既写 bmsync.log，也按详细程度打到终端。"""
     append_log(sp, ["[%s] watch: %s" % (fmt_ts(now_ts()), message)])
@@ -2459,6 +2560,8 @@ def cmd_watch(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     而且读取开销极小（每秒不到 1ms）。真正的限制在浏览器侧——它们把书签放在内存里，
     退出时才整份写回，所以"实时"的粒度是浏览器落盘的频率。
     """
+    if getattr(args, "why", None):
+        return cmd_watch_why(cfg, args)
     if getattr(args, "verify", False):
         return watch_verify(cfg, args)
     if getattr(args, "stop", False):
@@ -3121,6 +3224,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = new_sub("watch", help="实时同步：监听书签文件变化并自动同步")
     p.add_argument("--once", type=float, metavar="秒", help="跑指定秒数后退出（用于自测）")
     p.add_argument("--verify", action="store_true", help="只自检一次：权限、指纹、参数")
+    p.add_argument("--why", type=float, metavar="秒", nargs="?", const=60,
+                   help="观察一段时间，报告文件被重写时书签内容是否真的变了（默认 60 秒）")
     p.add_argument("--stop", action="store_true", help="停止常驻监听服务")
     p.add_argument("--no-initial", action="store_true", help="启动时不做兜底同步")
     p.add_argument("--lock", help="锁文件路径（默认 state/bmsync.lock）")
