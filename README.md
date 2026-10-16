@@ -16,8 +16,9 @@ Safari Bookmarks.plist ──┘   (基线 state.json)    └─→ 写回 Safar
 
 - 支持 macOS 自带 Python 3.9+，无第三方依赖
 - 冲突按修改时间判定，并逐条打印冲突说明
-- 每次写入前自动备份两边原文件，随时可回滚
+- 备份按内容去重 + 分级保留，不会因实时同步而爆量
 - 三种工作模式：手动 / 定时（launchd）/ **实时（监听文件变化）**
+- **浏览器不用退出**：配一个 Chrome 扩展，通过官方书签 API 落地改动（见第 4 节）
 - 99 项端到端测试（含对真实 Chrome 书签的无损往返验证）
 
 ---
@@ -153,6 +154,39 @@ Safari 的书签文件受 macOS 的 TCC 保护，`chmod`、`sudo` 都没用，�
 
 **想要双向都可靠落地**，推荐这样用：退出 Chrome 和 Safari → `bmsync sync`（或让实时模式自己触发一次）→ 再打开浏览器。这样两边都是"退出时写盘、启动时读盘"，不会有内存覆盖。
 
+### 让 Chrome 开着也能同步：配套扩展（推荐）
+
+上面第 2 条限制的根治办法是用 Chrome **官方的书签 API**——也就是一个扩展。仓库里的 `extension/` 就是干这个的：
+
+```
+extension/
+├── manifest.json    # MV3，只申请 bookmarks 权限
+├── background.js    # 定时向本地桥接拉取"要新增/删除什么"，用官方 API 应用
+├── popup.html/js    # 点扩展图标看连接状态
+```
+
+**安装**（一次性，约 1 分钟）：
+
+1. Chrome 地址栏打开 `chrome://extensions`
+2. 右上角打开 **开发者模式**
+3. 点 **加载已解压的扩展程序**，选择仓库里的 `extension` 目录
+4. 在终端运行 `./bin/bmsync watch`（或 `watch-daemon start`）
+5. 点扩展图标，看到 **已连接** 就生效了
+
+**它如何工作**：`bmsync watch` 会在 `127.0.0.1:8765` 起一个只监听本机的桥接服务（可用 `watch.bridge_port` 改端口，设 `0` 关闭）。扩展每 20 秒拉一次差异，用 `chrome.bookmarks` 应用新增/删除/改名。
+
+**装上之后的行为变化**：
+
+| | 扩展未安装/未连接 | 扩展已连接 |
+| --- | --- | --- |
+| Chrome 落盘方式 | bmsync 直接改 `Bookmarks` 文件（浏览器运行时可能被覆盖） | **扩展通过官方 API 应用，立即生效且不会被覆盖** |
+| Chrome 文件 | 会被改写 | **完全不动**（避免和扩展互相覆盖） |
+| 可靠性 | Chrome 运行时可能丢改动 | 双向可靠 |
+
+**安全说明**：桥接只绑定 `127.0.0.1`，不对外暴露；扩展只申请 `bookmarks` 权限，且只访问 `127.0.0.1`，不向任何外部服务器发送数据。所有代码都在 `extension/` 里，可以直接审阅。
+
+**扩展不在线时会怎样**：bmsync 会退回"直接改文件"的方式，并且只在**两边都确实拿到**某条书签后才把它记进基线——所以未落地的改动会在下一轮自动重试，不会丢，也不会被误判成删除。
+
 > 判断"到底是没同步、还是浏览器延后写盘"，看一行就知道：
 > ```bash
 > while :; do stat -f "%Sm %N" -t "%H:%M:%S" ~/Library/Safari/Bookmarks.plist; sleep 1; done
@@ -259,7 +293,11 @@ launchctl start com.bmsync.sync
 - **Safari 的阅读列表（Reading List）默认不参与同步**，按 `WebBookmarkSpecialID` 识别，容器及其内容原样保留。因为阅读列表条目看起来就是普通书签，一旦导入会在 Chrome 里变成重复书签。要改就编辑 `config.json` 的 `sync.skip_folders`。
 - **Safari 的"个人收藏"= Chrome 的"书签栏"**，Safari 的"书签菜单"= Chrome 的"其他书签"。
 - **不会动 guid / UUID**：能对上的节点沿用原有 id 和 guid，减少 Chrome 云端同步的额外动作。
-- **写文件用"先写临时文件再替换"**，并在每次写入前把两边原文件备份进 `state/backups/`（默认保留 20 份）。
+- **写文件用"先写临时文件再替换"**，并在写入前把两边原文件备份进 `state/backups/`。
+  备份做了三层控制，实时同步也不会爆量：
+  1. **按内容去重**：忽略 `checksum`、`date_last_used` 等每次都会变的字段，内容没变就不新增备份
+  2. **最小间隔**：`sync.backup_min_interval`（默认 300 秒）内的连续变化只留最近一份
+  3. **分级保留**：24 小时内全留、1 周内每小时 1 份、1 个月内每天 1 份、更早只留 `backup_keep` 份
 - 只同步**书签**，不碰历史记录、扩展、密码等其他数据。
 
 ## 7. 配置文件
@@ -279,13 +317,16 @@ launchctl start com.bmsync.sync
   "watch": {
     "interval": 5.0,
     "settle": 3.0,
-    "resync_after": 60.0
+    "resync_after": 60.0,
+    "bridge_port": 8765,
+    "bridge_timeout": 90.0
   },
   "sync": {
     "direction": "both",
     "prefer": "newest",
     "skip_folders": ["com.apple.ReadingList", "Reading List", "阅读列表"],
     "backup_keep": 20,
+    "backup_min_interval": 300,
     "require_browsers_closed": true
   },
   "state_dir": "/path/to/bmsync/state",
@@ -294,7 +335,8 @@ launchctl start com.bmsync.sync
 ```
 
 - `mode`：`manual` / `scheduled` / `watch`（用 `bmsync mode` 切换更省事）
-- `watch`：实时模式的节奏参数，见第 3 节
+- `watch`：实时模式的节奏参数，见第 3 节；`bridge_port` 是给 Chrome 扩展用的本地端口（0 = 关闭）
+- `backup_keep` / `backup_min_interval`：备份保留份数与最小间隔，见第 6 节
 - `direction`：`both` 双向；`chrome2safari` / `safari2chrome` 单向（只把源的变化应用到目标，目标自己的书签不受影响，冲突一律以源为准）
 - `prefer`：`newest`（默认，按修改时间）/ `chrome` / `safari`
 - 其他 Chromium 系浏览器（Edge、Brave、Vivaldi）改 `user_data_dir` 即可
@@ -333,6 +375,7 @@ bmsync/
 ├── .github/
 │   ├── workflows/tests.yml      # CI：macOS 上跑测试 + lint
 │   └── ISSUE_TEMPLATE/          # Issue 模板（引导附带 doctor 输出）
+├── extension/                   # 配套 Chrome 扩展（让浏览器开着也能同步）
 ├── CHANGELOG.md                 # 变更记录
 ├── pyproject.toml               # 元数据（运行不需要安装）
 └── state/                       # 运行时生成（已在 .gitignore 中）

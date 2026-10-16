@@ -1257,12 +1257,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "interval": 5.0,              # 轮询间隔（秒）
         "settle": 3.0,               # 文件连续多久没变化才算"写完了"（秒）
         "resync_after": 60.0,         # 启动时/长时间无变化后，至少多久做一次兜底同步（秒）
+        "bridge_port": 8765,          # 给 Chrome 扩展用的本地桥接端口（0 = 关闭）
+        "bridge_timeout": 90.0,       # 扩展多久没心跳就认为它不在线（秒）
     },
     "sync": {
         "direction": "both",
         "prefer": "newest",
         "skip_folders": list(DEFAULT_SKIP_FOLDERS),
-        "backup_keep": 20,
+        "backup_keep": 20,            # 分级保留：30 天以上只留这么多份
+        "backup_min_interval": 300,   # 距上次备份不足这么多秒且"实质内容"没变，就不新增备份
         "require_browsers_closed": True,
     },
     "state_dir": str(APP_DIR / "state"),
@@ -1337,7 +1340,23 @@ def state_paths(cfg: Dict[str, Any]) -> Dict[str, Path]:
     d = expand(cfg["state_dir"])
     return {"dir": d, "state": d / "state.json", "backups": d / "backups",
             "log": expand(cfg.get("log_file") or (d / "bmsync.log")),
-            "lock": d / "bmsync.lock", "watch_pid": d / "watch.pid"}
+            "lock": d / "bmsync.lock", "watch_pid": d / "watch.pid",
+            "bridge": d / "bridge.json"}
+
+
+def bridge_state_path(cfg: Dict[str, Any]) -> Path:
+    return state_paths(cfg)["bridge"]
+
+
+def bridge_active(cfg: Dict[str, Any]) -> bool:
+    """Chrome 扩展是否在线（最近有心跳）。在线时由扩展写 Chrome，bmsync 不再改它的文件。"""
+    path = bridge_state_path(cfg)
+    try:
+        info = json.loads(path.read_text(encoding="utf-8"))
+        age = now_ts() - float(info.get("last_seen", 0))
+        return age <= float((cfg.get("watch") or {}).get("bridge_timeout", 90.0))
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def empty_state() -> Dict[str, Any]:
@@ -1419,26 +1438,137 @@ def append_log(sp: Dict[str, Path], lines: Sequence[str]) -> None:
         pass
 
 
-def make_backup(path: Path, backups_dir: Path, keep: int = 20) -> Optional[Path]:
-    if not path.exists():
-        return None
-    backups_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    tag = "chrome" if path.name == "Bookmarks" else safe_filename(path.parent.name or path.name)
-    dest = backups_dir / ("%s.%s%s" % (tag, stamp, path.suffix or ".bak"))
-    try:
-        shutil.copy2(path, dest)
-    except OSError as exc:
-        eprint("备份失败（继续执行）：%s：%s" % (dest, exc))
-        return None
-    existing = sorted(backups_dir.glob("%s.*" % tag))
-    if keep > 0:
-        for stale in existing[:-keep]:
+def _backup_name(path: Path) -> str:
+    return "chrome" if path.name == "Bookmarks" else safe_filename(path.parent.name or path.name)
+
+
+def prune_backups(backups_dir: Path, tag: str, keep: int = 20) -> List[str]:
+    """
+    分级保留：越旧的备份留得越稀，既不爆量又能覆盖"最近"和"久远"两种回滚需求。
+
+      最近 24 小时   → 全部保留（按内容去重后本来就不多）
+      24 小时 ~ 7 天 → 每小时留 1 份
+      7 ~ 30 天      → 每天留 1 份
+      30 天以上      → 只留最近 keep 份
+
+    文件名格式：<tag>.<时间戳>-<内容哈希前12位><后缀>
+    """
+    files = sorted(backups_dir.glob("%s.*" % tag))
+    parsed = []
+    for f in files:
+        m = re.match(r"^%s\.(\d{8}-\d{6})-([0-9a-f]{12})" % re.escape(tag), f.name)
+        try:
+            ts = datetime.strptime(m.group(1), "%Y%m%d-%H%M%S").timestamp() if m else f.stat().st_mtime
+        except (ValueError, OSError):
+            ts = f.stat().st_mtime
+        parsed.append((ts, f))
+    parsed.sort()
+    now = now_ts()
+    hour, day = 3600, 86400
+    kept: set = set()
+    seen_hours: set = set()
+    seen_days: set = set()
+    for ts, f in reversed(parsed):            # 从新到旧扫描
+        age = now - ts
+        if age <= day:
+            kept.add(f)
+        elif age <= 7 * day:
+            key = int(ts // hour)
+            if key not in seen_hours:
+                seen_hours.add(key)
+                kept.add(f)
+        elif age <= 30 * day:
+            key = int(ts // day)
+            if key not in seen_days:
+                seen_days.add(key)
+                kept.add(f)
+    older = [f for ts, f in parsed if now - ts > 30 * day]
+    kept.update(older[-keep:] if keep > 0 else [])
+    removed = []
+    for _, f in parsed:
+        if f not in kept:
             try:
-                stale.unlink()
+                f.unlink()
+                removed.append(f.name)
             except OSError:
                 pass
-    return dest
+    return removed
+
+
+def _backup_fingerprint(data: bytes) -> str:
+    """
+    备份去重用的指纹。直接对字节做哈希太"敏感"——Chrome 的 Bookmarks 里有 checksum、
+    date_last_used 等每次都会变的字段，Safari 的 plist 也会被系统周期性重写，
+    内容其实没变却会各存一份。这里先剥掉这些易变字段再算指纹。
+    """
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return hashlib.sha256(data).hexdigest()
+    if not isinstance(raw, dict) or "roots" not in raw:
+        return hashlib.sha256(data).hexdigest()
+    volatile = {"checksum", "sync_metadata", "date_last_used", "date_modified", "date_added",
+                "meta_info", "id", "guid"}
+
+    def strip(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {k: strip(v) for k, v in sorted(node.items()) if k not in volatile}
+        if isinstance(node, list):
+            return [strip(v) for v in node]
+        return node
+
+    return hashlib.sha256(json_dumps_compact(strip(raw)).encode("utf-8")).hexdigest()
+
+
+def backup_file(path: Path, backups_dir: Path, keep: int = 20,
+                content: Optional[bytes] = None,
+                min_interval: float = 0.0) -> Tuple[Optional[Path], bool]:
+    """
+    写盘前备份。返回 (备份路径, 是否真的新建了备份)。
+
+    关键改进：**内容没变就不备份**。原先每次同步都无条件复制一份，实时模式下每 20 秒
+    就会多出两个文件；而同步本身是幂等的，绝大多数次的内容完全相同，那些备份毫无价值。
+    """
+    if not path.exists():
+        return None, False
+    backups_dir.mkdir(parents=True, exist_ok=True)
+    tag = _backup_name(path)
+    try:
+        data = content if content is not None else path.read_bytes()
+    except OSError as exc:
+        eprint("备份失败（继续执行）：%s：%s" % (path, exc))
+        return None, False
+    digest = _backup_fingerprint(data)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = backups_dir / ("%s.%s-%s%s" % (tag, stamp, digest[:12], path.suffix or ".bak"))
+
+    # 与最近一份备份"实质内容"相同 → 直接复用，不新增
+    latest = None
+    for existing in sorted(backups_dir.glob("%s.*" % tag), reverse=True):
+        if existing.is_file() and not existing.name.startswith("."):
+            latest = existing
+            break
+    if latest is not None:
+        try:
+            if _backup_fingerprint(latest.read_bytes()) == digest:
+                return latest, False
+        except OSError:
+            pass
+        # 实质内容不同、但距上次备份太近（浏览器在频繁改写文件）→ 先不备份，
+        # 等到间隔够了再留一份，避免实时模式把备份目录刷爆
+        if min_interval > 0:
+            try:
+                if now_ts() - latest.stat().st_mtime < min_interval:
+                    return latest, False
+            except OSError:
+                pass
+    try:
+        atomic_write(dest, data, keep_mode_from=path)
+    except OSError as exc:
+        eprint("备份失败（继续执行）：%s：%s" % (dest, exc))
+        return None, False
+    prune_backups(backups_dir, tag, keep)
+    return dest, True
 
 
 # --------------------------------------------------------------------------------------
@@ -1942,17 +2072,56 @@ def run_sync(cfg: Dict[str, Any], chrome: ChromeBackend, safari: SafariBackend, 
                 print("     …（其余 %d 处省略，用 --max-show 调整）" % (len(steps) - max_show))
     else:
         # 7) 备份 + 写入
+        chrome_handled_by_extension = bridge_active(cfg)
+        baseline = merged
+        if chrome_handled_by_extension:
+            # 扩展负责把改动应用到 Chrome，而它什么时候应用完只有它自己知道。
+            # 如果此刻就把 merged 整体记为基线，下一轮会把「Chrome 里还没有的条目」
+            # 误判成「被删除」，于是把书签从两边一起抹掉 —— 实测确实会丢数据。
+            #
+            # 正确语义：基线只记录**两个浏览器都已经有了**的内容（按内容指纹取交集）。
+            # 只在一边的东西不算"已同步"，下一轮会再被检测成新增并重试 —— 新增是幂等的，
+            # 而且绝不能像删除那样丢数据。
+            in_chrome = {it.fingerprint() for it in chrome_tree.items.values()}
+            shared = Tree()
+            for _cid in CONTAINERS:
+                shared.add(Item(id=_cid, kind="folder", name=_cid, parent_id=ROOT_ID))
+            for _iid, _item in merged.items.items():
+                if _iid in CONTAINERS:
+                    continue
+                if _item.fingerprint() not in in_chrome:
+                    continue          # Chrome 里还没有 → 留到下一轮重试，不写进基线
+                if _item.parent_id is None or _item.parent_id not in shared.items:
+                    continue
+                shared.add(Item(id=_iid, kind=_item.kind, name=_item.name,
+                                parent_id=_item.parent_id, url=_item.url, mtime=_item.mtime))
+            for _iid, _item in merged.items.items():
+                if _iid in CONTAINERS or _iid in shared.items:
+                    continue
+                if _item.kind == "folder" and _item.parent_id in shared.items:
+                    shared.add(Item(id=_iid, kind="folder", name=_item.name,
+                                    parent_id=_item.parent_id, mtime=_item.mtime))
+            # 注意：写盘仍然用完整的 merged（否则会把 Safari 自己新增、还没进 Chrome 的
+            # 书签一起删掉）；只有"记基线"才用交集树。
+            baseline = shared
         keep = cfg["sync"].get("backup_keep", 20)
         backups = []
+        min_interval = float(cfg["sync"].get("backup_min_interval", 300) or 0)
         for backend in (chrome, safari):
-            b = make_backup(backend.bookmarks_path, sp["backups"], keep)
+            b, created = backup_file(backend.bookmarks_path, sp["backups"], keep,
+                                     min_interval=min_interval)
             if b:
-                backups.append(str(b))
+                backups.append("%s%s" % (b, "" if created else "（内容未变，复用已有备份）"))
         try:
             # direction 表示"以谁为源"：chrome2safari 只写目标 Safari，safari2chrome 只写目标 Chrome
             if direction != "chrome2safari":
-                steps_c = chrome.write_tree(merged, chrome.build_native_map(chrome.read_raw(), merged))
-                log("  Chrome 写入：%s" % ("；".join(steps_c) or "无变化"), verbose)
+                if chrome_handled_by_extension:
+                    # 扩展在线 → Chrome 由它通过官方书签 API 应用改动。
+                    # 此时若再去改 Bookmarks 文件，会和扩展互相覆盖（Chrome 的内存内容最终胜出）。
+                    log("  Chrome 写入：交给 Chrome 扩展（桥接在线，直接改文件会被浏览器覆盖）", verbose)
+                else:
+                    steps_c = chrome.write_tree(merged, chrome.build_native_map(chrome.read_raw(), merged))
+                    log("  Chrome 写入：%s" % ("；".join(steps_c) or "无变化"), verbose)
             if direction != "safari2chrome":
                 steps_s = safari.write_tree(merged)
                 log("  Safari 写入：%s" % ("；".join(steps_s) or "无变化"), verbose)
@@ -1960,7 +2129,7 @@ def run_sync(cfg: Dict[str, Any], chrome: ChromeBackend, safari: SafariBackend, 
             eprint("[错误] 写入失败，原文件已备份在：%s" % sp["backups"])
             raise
 
-        save_state(sp, state, merged, summary, result.tombstones)
+        save_state(sp, state, baseline, summary, result.tombstones)
         lines = ["[%s] %s" % (fmt_ts(now_ts()), json.dumps(summary, ensure_ascii=False))]
         for side, steps in plan.items():
             for step in steps:
@@ -1987,6 +2156,183 @@ def cmd_sync(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     sp = state_paths(cfg)
     state = load_state(sp)
     return run_sync(cfg, chrome, safari, sp, state, args)
+
+
+# --------------------------------------------------------------------------------------
+# 本地桥接：让运行中的 Chrome 也能被写入（通过配套扩展走官方书签 API）
+# --------------------------------------------------------------------------------------
+#
+# 为什么需要它：Chrome 把书签放在内存里，退出/保存时整份重写 Bookmarks 文件。
+# 直接改文件对运行中的 Chrome 无效 —— 几秒后就被内存内容覆盖。唯一可靠的办法是用
+# Chrome 官方的 chrome.bookmarks API，也就是一个扩展。这里起一个只监听 127.0.0.1
+# 的小 HTTP 服务，扩展定时拉取"需要新增/删除哪些书签"并应用。
+
+BRIDGE_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>bmsync 桥接</title>
+<style>body{font:14px/1.6 -apple-system,sans-serif;max-width:640px;margin:40px auto;padding:0 20px}
+code{background:#f2f2f2;padding:1px 5px;border-radius:3px}</style></head><body>
+<h2>bmsync 本地桥接运行中</h2>
+<p>这个端口是给 Chrome 扩展用的，只监听本机回环地址，不对外暴露。</p>
+<ul>
+<li><code>GET /ping</code> —— 扩展心跳</li>
+<li><code>GET /delta</code> —— 取出"需要应用到 Chrome 的书签增删"</li>
+<li><code>POST /applied</code> —— 扩展报告已应用</li>
+</ul>
+<p>浏览器里打开这个页面通常说明你误点了扩展的地址；关掉即可。</p>
+</body></html>"""
+
+
+def _bridge_containers(tree: Tree) -> Dict[str, List[Any]]:
+    """把统一树里各容器的书签整理成扩展能直接用的形式。"""
+    out: Dict[str, List[Any]] = {}
+    for cid, label in CONTAINER_LABELS.items():
+        items = []
+        for item_id in tree.subtree_ids(cid):
+            it = tree.items.get(item_id)
+            if it is None or it.kind != "bookmark":
+                continue
+            path = [CONTAINER_LABELS.get(p, tree.items[p].name)
+                    for p in tree.path_ids(item_id)[1:-1]
+                    if p in tree.items and p not in CONTAINERS]
+            items.append({"title": it.name, "url": it.url, "path": path})
+        out[label] = items
+    return out
+
+
+def _bridge_delta(sp: Dict[str, Path], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """算出"Chrome 扩展需要执行什么"：相对 Chrome 当前树，多了哪些、少了哪些。"""
+    state = load_state(sp)
+    merged = tree_from_state(state["base"]) if state["base"].get("items") else Tree()
+    chrome, _ = build_backends(cfg)
+    try:
+        current = chrome.read_tree(skip_folders=cfg["sync"].get("skip_folders") or [])
+    except Exception as exc:  # noqa: BLE001
+        return {"error": "无法读取 Chrome 书签：%s" % exc, "add": [], "remove": [], "rename": []}
+
+    def rel_path(tree: Tree, item_id: str) -> List[str]:
+        """书签相对容器的路径（含容器名），例如 ["书签栏","工具"]。"""
+        names = []
+        for pid in tree.path_ids(item_id):
+            if pid in CONTAINERS:
+                names.append(CONTAINER_LABELS.get(pid, pid))
+            else:
+                node = tree.items.get(pid)
+                names.append(node.name if node else pid)
+        return names
+
+    want: Dict[str, Any] = {}          # 规范化 URL -> 期望的书签
+    for item_id, node in merged.items.items():
+        if node.kind == "bookmark" and node.url:
+            want.setdefault(norm_url(node.url), node)
+    have: Dict[str, Any] = {}          # 规范化 URL -> Chrome 现有的书签
+    for item_id, node in current.items.items():
+        if node.kind == "bookmark" and node.url:
+            have.setdefault(norm_url(node.url), node)
+
+    add, rename = [], []
+    for url, node in want.items():
+        full = rel_path(merged, node.id)
+        path = full[:-1] if full else []
+        if url not in have:
+            add.append({"title": node.name, "url": node.url, "path": path})
+        elif norm_name(have[url].name) != norm_name(node.name):
+            rename.append({"url": node.url, "title": node.name, "currentTitle": have[url].name})
+    remove = []
+    for url, node in have.items():
+        if url in want:
+            continue
+        full = rel_path(current, node.id)
+        remove.append({"url": node.url, "title": node.name, "path": full[:-1] if full else []})
+    return {"add": add, "remove": remove, "rename": rename,
+            "generated": fmt_ts(now_ts()),
+            "counts": {"add": len(add), "remove": len(remove), "rename": len(rename)}}
+
+
+def _bridge_touch(sp: Dict[str, Path]) -> None:
+    try:
+        atomic_write(sp["bridge"], json.dumps({"last_seen": now_ts()}).encode("utf-8"))
+    except OSError:
+        pass
+
+
+def start_bridge(cfg: Dict[str, Any], sp: Dict[str, Path], port: int) -> Optional[Any]:
+    """启动桥接服务（后台线程）。返回 server 对象，失败返回 None。"""
+    import http.server
+    import threading
+    from urllib.parse import urlparse
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, code: int, body: bytes, ctype: str = "application/json; charset=utf-8") -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: Any) -> None:      # 别把访问日志打到 stdout
+            pass
+
+        def _guard(self, fn: Any) -> None:
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001
+                # 处理器里抛异常会让连接直接断掉，客户端只能看到 RemoteDisconnected，
+                # 完全不知道发生了什么；这里统一下降级成 JSON 错误
+                try:
+                    self._send(500, json.dumps({"error": "%s: %s" % (type(exc).__name__, exc)},
+                                               ensure_ascii=False).encode("utf-8"))
+                except OSError:
+                    pass
+                append_log(sp, ["[%s] 桥接处理 %s 出错：%s: %s"
+                                % (fmt_ts(now_ts()), self.path, type(exc).__name__, exc)])
+
+        def do_GET(self) -> None:                        # noqa: N802
+            self._guard(self._handle_get)
+
+        def _handle_get(self) -> None:
+            path = urlparse(self.path).path
+            _bridge_touch(sp)
+            if path == "/ping":
+                self._send(200, json.dumps({"ok": True, "app": "bmsync",
+                                            "version": __version__}).encode("utf-8"))
+            elif path == "/delta":
+                self._send(200, json.dumps(_bridge_delta(sp, cfg), ensure_ascii=False)
+                           .encode("utf-8"))
+            elif path == "/":
+                self._send(200, BRIDGE_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            else:
+                self._send(404, b'{"error":"not found"}')
+
+        def do_POST(self) -> None:                       # noqa: N802
+            self._guard(self._handle_post)
+
+        def _handle_post(self) -> None:
+            _bridge_touch(sp)
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else b""
+            path = urlparse(self.path).path
+            if path == "/applied":
+                try:
+                    info = json.loads(body.decode("utf-8"))
+                except ValueError:
+                    info = {}
+                append_log(sp, ["[%s] 扩展已应用改动：%s" % (fmt_ts(now_ts()),
+                                                        json.dumps(info, ensure_ascii=False)[:200])])
+                self._send(200, b'{"ok":true}')
+            else:
+                self._send(404, b'{"error":"not found"}')
+
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as exc:
+        eprint("[错误] 无法启动桥接服务（端口 %d）：%s" % (port, exc))
+        eprint("       换个端口：bmsync watch --bridge-port 8888")
+        return None
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 
 # --------------------------------------------------------------------------------------
@@ -2086,6 +2432,14 @@ def cmd_watch(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
             eprint("[错误] 无法写入 %s：%s" % (backend.label, check_writable(backend.bookmarks_path)[1]))
             return 2
 
+    bridge_port = int(getattr(args, "bridge_port", 0) or (cfg.get("watch") or {}).get("bridge_port", 8765) or 0)
+    bridge_server = None
+    if bridge_port and not getattr(args, "no_bridge", False):
+        bridge_server = start_bridge(cfg, sp, bridge_port)
+        if bridge_server:
+            print("  桥接：http://127.0.0.1:%d（Chrome 扩展连这里，%s）"
+                  % (bridge_port, "已就绪" if bridge_active(cfg) else "等待扩展连接"))
+
     if once:
         log("实时同步自检（只跑一轮）", 1, verbose)
     else:
@@ -2183,6 +2537,8 @@ def cmd_watch(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("")
         watch_log(sp, "实时同步已停止（Ctrl+C）", verbose)
+        if bridge_server is not None:
+            bridge_server.shutdown()
         return 0
     except Exception as exc:  # noqa: BLE001
         # 常驻服务里异常退出会很难发现，这里务必留下记录
@@ -2569,7 +2925,7 @@ def cmd_init_config(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
         "chrome": {"user_data_dir": "~/Library/Application Support/Google/Chrome", "profile": "Default"},
         "safari": {"bookmarks_path": "~/Library/Safari/Bookmarks.plist"},
         "sync": {"direction": "both", "prefer": "newest", "skip_folders": list(DEFAULT_SKIP_FOLDERS),
-                 "backup_keep": 20, "require_browsers_closed": True},
+                 "backup_keep": 20, "backup_min_interval": 300, "require_browsers_closed": True},
         "state_dir": str(sp["dir"]),
         "log_file": str(sp["log"]),
     }
@@ -2682,6 +3038,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stop", action="store_true", help="停止常驻监听服务")
     p.add_argument("--no-initial", action="store_true", help="启动时不做兜底同步")
     p.add_argument("--lock", help="锁文件路径（默认 state/bmsync.lock）")
+    p.add_argument("--bridge-port", type=int, help="本地桥接端口（默认取配置，0 = 关闭）")
+    p.add_argument("--no-bridge", action="store_true", help="不启动桥接服务")
     p.set_defaults(func=cmd_watch)
 
     p = new_sub("watch-daemon", help="把实时同步装成常驻服务（登录自启、掉线拉起）")

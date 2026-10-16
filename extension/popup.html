@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font: 13px/1.6 -apple-system, "PingFang SC", sans-serif; width: 320px; margin: 0; padding: 14px; }
+    h3 { margin: 0 0 8px; font-size: 14px; }
+    .row { display: flex; justify-content: space-between; padding: 3px 0; }
+    .ok { color: #2e7d32; } .bad { color: #d32f2f; } .dim { color: #777; }
+    code { background: #f2f2f2; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    ul { margin: 6px 0 0; padding-left: 18px; }
+    #detail { margin-top: 10px; border-top: 1px solid #eee; padding-top: 8px; }
+  </style>
+</head>
+<body>
+  <h3>bmsync 桥接</h3>
+  <div class="row"><span>桥接服务</span><span id="online" class="dim">检查中…</span></div>
+  <div class="row"><span>上次检查</span><span id="at" class="dim">-</span></div>
+  <div id="detail" class="dim">正在查询…</div>
+  <p class="dim" style="margin-top:10px">
+    需要在终端运行 <code>bmsync watch</code>（或常驻服务）才会连上。<br>
+    本扩展只访问 <code>127.0.0.1</code>，不向外发送任何数据。
+  </p>
+  <script src="popup.js"></script>
+</body>
+</html>

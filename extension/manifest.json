@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "bmsync 桥接（Chrome ↔ Safari 书签同步）",
+  "version": "1.0.0",
+  "description": "让 bmsync 在 Chrome 运行时也能同步书签：通过官方书签 API 应用来自 Safari 的改动。",
+  "permissions": ["bookmarks"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "bmsync 桥接",
+    "default_popup": "popup.html"
+  },
+  "icons": {}
+}

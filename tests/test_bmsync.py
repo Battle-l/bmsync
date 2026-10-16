@@ -13,12 +13,15 @@ bmsync 自测：在临时沙盒里用真实的 Chrome 书签文件 + 合成的 S
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -866,6 +869,180 @@ def scenario_realtime(tmp: Path):
           "install-scheduler" in sb.run("mode", "scheduled").stdout)
 
 
+def scenario_backups(tmp: Path):
+    """备份策略：内容没变不新增、太频繁不新增、分级保留不爆量。"""
+    print("\n[11] 备份策略（去重 + 最小间隔 + 分级保留）")
+    sb = Sandbox(tmp / "bak")
+    sb.install_chrome(chrome_fixture([url_node("A", "https://a.example")]))
+    sb.install_safari(safari_fixture([leaf("B", "https://b.example")]))
+    sb.write_config()
+    bdir = sb.state_dir / "backups"
+    bdir.mkdir(parents=True, exist_ok=True)
+    f = sb.chrome_bookmarks
+
+    p1, created1 = bmsync.backup_file(f, bdir, 20, min_interval=0)
+    check("首次备份会创建文件", created1 and p1 is not None, str(p1))
+    check("备份文件名带内容指纹",
+          p1 is not None and re.search(r"\.\d{8}-\d{6}-[0-9a-f]{12}\.bak$", p1.name) is not None,
+          p1.name if p1 else "")
+
+    # 只改易变字段（checksum / date_last_used）：实质内容没变，不该新增备份
+    raw = json.loads(f.read_text(encoding="utf-8"))
+    raw["checksum"] = "f" * 32
+    raw["roots"]["bookmark_bar"]["children"][0]["date_last_used"] = "123456"
+    f.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    _, created2 = bmsync.backup_file(f, bdir, 20, min_interval=0)
+    check("只改 checksum/时间戳不产生新备份", not created2)
+
+    # 真的加了书签：间隔未到 → 不新增；间隔到了 → 新增
+    raw = json.loads(f.read_text(encoding="utf-8"))
+    raw["roots"]["bookmark_bar"]["children"].append(url_node("新书签", "https://new.example"))
+    f.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    _, created3 = bmsync.backup_file(f, bdir, 20, min_interval=300)
+    check("实质变化但间隔未到 → 暂不备份", not created3)
+    _, created4 = bmsync.backup_file(f, bdir, 20, min_interval=0)
+    check("间隔允许后新增备份", created4)
+    check("整个过程只产生 2 份备份（而非 4 份）",
+          len([x for x in bdir.iterdir() if x.is_file()]) == 2,
+          str(sorted(x.name for x in bdir.iterdir())))
+
+    # 分级保留：造 40 份"最近 1 小时"的备份，全部保留；造 5 份 40 天前的，只留 keep 份
+    thinning = tmp / "bak" / "thin"
+    thinning.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now()
+    for i in range(40):                                  # 最近 1 小时内，每分钟一份
+        ts = stamp - timedelta(minutes=i)
+        (thinning / ("chrome.%s-%012x.bak" % (ts.strftime("%Y%m%d-%H%M%S"), i))).write_text("x")
+    for i in range(5):                                   # 40 天前
+        ts = stamp - timedelta(days=40, minutes=i)
+        (thinning / ("chrome.%s-%012x.bak" % (ts.strftime("%Y%m%d-%H%M%S"), 100 + i))).write_text("x")
+    removed = bmsync.prune_backups(thinning, "chrome", keep=2)
+    left = sorted(x.name for x in thinning.iterdir())
+    def stamp_of(name):
+        return name.split(".")[1][:8]          # chrome.<YYYYMMDD>-<HHMMSS>-<hash>.bak
+
+    day_ago = (stamp - timedelta(days=1)).strftime("%Y%m%d")
+    month_ago = (stamp - timedelta(days=30)).strftime("%Y%m%d")
+    check("最近 24 小时的备份全部保留",
+          len([n for n in left if stamp_of(n) >= day_ago]) == 40,
+          "%d 份（应为 40）" % len([n for n in left if stamp_of(n) >= day_ago]))
+    check("30 天以上只保留 keep 份",
+          len([n for n in left if stamp_of(n) < month_ago]) == 2,
+          "实际 %d 份" % len([n for n in left if stamp_of(n) < month_ago]))
+    check("确实清理掉了旧备份", len(removed) >= 3, "清理了 %d 份" % len(removed))
+
+
+def scenario_bridge(tmp: Path):
+    """桥接服务：扩展在线时由扩展写 Chrome，bmsync 不再碰文件。"""
+    print("\n[12] 本地桥接（让运行中的 Chrome 也能被同步）")
+    sb = Sandbox(tmp / "bridge")
+    sb.install_chrome(chrome_fixture([url_node("Chrome 原有", "https://c.example")]))
+    sb.install_safari(safari_fixture([leaf("Safari 原有", "https://s.example")]))
+    sb.write_config()
+    cfg = bmsync.load_config(sb.config)
+    sp = bmsync.state_paths(cfg)
+    sb.state_dir.mkdir(parents=True, exist_ok=True)
+
+    # 12.1 扩展在线判定取决于心跳新鲜度
+    check("没有心跳时视为扩展离线", not bmsync.bridge_active(cfg))
+    sp["bridge"].write_text(json.dumps({"last_seen": bmsync.now_ts()}), encoding="utf-8")
+    check("心跳新鲜时视为扩展在线", bmsync.bridge_active(cfg))
+    sp["bridge"].write_text(json.dumps({"last_seen": bmsync.now_ts() - 99999}), encoding="utf-8")
+    check("心跳过期后视为离线", not bmsync.bridge_active(cfg))
+
+    # 12.2 delta 语义：已经在 Chrome 里的东西不该再要求添加；且永不要求删除已有书签
+    sb.run("sync")
+    sb.state_dir.joinpath("bridge.json").write_text(json.dumps({"last_seen": bmsync.now_ts()}),
+                                                    encoding="utf-8")
+    delta = bmsync._bridge_delta(sp, cfg)
+    check("同步完成后的 delta 不含重复新增", delta["counts"]["add"] == 0,
+          json.dumps(delta["counts"], ensure_ascii=False))
+    check("delta 不会要求删除 Chrome 已有书签",
+          not any("c.example" in r["url"] for r in delta["remove"]), str(delta["remove"])[:120])
+    check("delta 里新增项都带目标路径",
+          all("path" in a and isinstance(a["path"], list) for a in delta["add"]))
+
+    # 12.3 扩展在线时同步不再改写 Chrome 文件（否则会和扩展互相覆盖）
+    before = sb.chrome_bookmarks.read_bytes()
+    sf = sb.read_safari()
+    sf["Children"][0]["Children"].append(leaf("又一条", "https://another.example"))
+    sb.install_safari(sf)
+    out = sb.run("sync", "-v")
+    check("扩展在线时 Chrome 文件不被改写", sb.chrome_bookmarks.read_bytes() == before,
+          "文件被改了")
+    check("日志里说明了交给扩展", "交给 Chrome 扩展" in out.stdout, out.stdout[-200:])
+
+    # 12.4 delta 必须给出带路径的待新增项：用"基线里有、Chrome 里没有"的状态直接验证
+    stale = tmp / "bridge" / "stale"
+    stale.mkdir(parents=True, exist_ok=True)
+    stale_cfg = dict(cfg)
+    stale_cfg["state_dir"] = str(stale)
+    sp_stale = bmsync.state_paths(stale_cfg)
+    stale_state = {"version": 3, "base": {"items": {}, "children": {}}, "history": [], "tombstones": {}}
+    items, children = {}, {}
+    for cid in bmsync.CONTAINERS:
+        items[cid] = {"kind": "folder", "name": cid, "parent": bmsync.ROOT_ID, "url": None, "mtime": None}
+        children[cid] = []
+    children[bmsync.ROOT_ID] = list(bmsync.CONTAINERS)
+    holder = "f:other/工具"
+    items[holder] = {"kind": "folder", "name": "工具", "parent": bmsync.OTHER_ID, "url": None, "mtime": None}
+    children[bmsync.OTHER_ID] = [holder]
+    children[holder] = ["u:https://only-safari.example/"]
+    items["u:https://only-safari.example/"] = {"kind": "bookmark", "name": "只在 Safari",
+                                               "parent": holder, "url": "https://only-safari.example",
+                                               "mtime": None}
+    stale_state["base"] = {"items": items, "children": children}
+    (stale / "state.json").write_text(json.dumps(stale_state, ensure_ascii=False), encoding="utf-8")
+    delta2 = bmsync._bridge_delta(sp_stale, stale_cfg)
+    want = [a for a in delta2["add"] if "only-safari" in a["url"]]
+    check("能给出待新增项及其路径", len(want) == 1 and want[0]["path"] == ["其他书签", "工具"],
+          json.dumps(delta2["add"], ensure_ascii=False)[:200])
+
+    # 12.5 扩展离线后恢复直接写文件
+    sp["bridge"].unlink()
+    sb.run("sync", "-v")
+    check("扩展离线后恢复写 Chrome 文件",
+          any("another.example" in (i.url or "") or "在" in (i.name or "")
+              for i in sb.chrome_tree().items.values())
+          or sb.chrome_bookmarks.read_bytes() != before,
+          "既没写文件也不包含新书签")
+
+    # 12.5 真实起一次桥接服务，走 HTTP 协议
+    srv = bmsync.start_bridge(cfg, sp, 0)          # 端口 0 = 让系统分配空闲端口
+    if srv is None:
+        check("桥接服务能启动", False, "start_bridge 返回 None")
+    else:
+        port = srv.server_address[1]
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/ping" % port, timeout=5) as r:
+                ping = json.loads(r.read().decode())
+            check("桥接 /ping 正常", ping.get("ok") is True and ping.get("app") == "bmsync", str(ping))
+            with urllib.request.urlopen("http://127.0.0.1:%d/delta" % port, timeout=5) as r:
+                over_http = json.loads(r.read().decode())
+            check("桥接 /delta 正常", "counts" in over_http, str(over_http)[:120])
+            req = urllib.request.Request("http://127.0.0.1:%d/applied" % port, data=b'{"added":1}',
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                applied = json.loads(r.read().decode())
+            check("桥接 /applied 正常", applied.get("ok") is True, str(applied))
+            check("/ping 会刷新心跳", bmsync.bridge_active(cfg))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    # 12.6 扩展文件齐全且 JSON 合法
+    ext = HERE.parent / "extension"
+    for name in ("manifest.json", "background.js", "popup.html", "popup.js"):
+        check("扩展文件存在：%s" % name, (ext / name).exists())
+    manifest = json.loads((ext / "manifest.json").read_text(encoding="utf-8"))
+    check("扩展用 mv3 且只申请 bookmarks 权限",
+          manifest.get("manifest_version") == 3 and manifest.get("permissions") == ["bookmarks"],
+          str(manifest.get("permissions")))
+    check("扩展只连本机地址", all("127.0.0.1" in h or "localhost" in h
+                                  for h in manifest.get("host_permissions", [])),
+          str(manifest.get("host_permissions")))
+
+
 def scenario_missing_permission(tmp: Path):
     """Safari 文件不可读时要给出明确的 TCC 提示，而不是一堆 traceback。"""
     print("\n[8] 权限缺失时的提示")
@@ -943,6 +1120,8 @@ def main():
     scenario_edge_cases(base)
     scenario_global_flags(base)
     scenario_realtime(base)
+    scenario_backups(base)
+    scenario_bridge(base)
     scenario_missing_permission(base)
 
     print("\n" + "=" * 70)
