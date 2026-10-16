@@ -1269,7 +1269,12 @@ def expand(path: Any) -> Path:
 
 def load_config(path: Optional[Path]) -> Dict[str, Any]:
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-    candidates = [Path(path)] if path else [APP_DIR / "config.json", Path.cwd() / "config.json"]
+    explicit = Path(path).expanduser() if path else None
+    if explicit is not None and not explicit.exists():
+        # 显式指定的配置文件不存在时如果静默回退到默认配置，很容易在错误的浏览器配置上跑同步
+        eprint("警告：指定的配置文件不存在：%s" % explicit)
+        eprint("      将改用默认配置（%s）。要自定义请先运行 bmsync init-config。" % (APP_DIR / "config.json"))
+    candidates = [explicit] if explicit else [APP_DIR / "config.json", Path.cwd() / "config.json"]
     for cand in candidates:
         if cand and cand.exists():
             try:
