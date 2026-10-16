@@ -1,0 +1,106 @@
+name: Bug 反馈
+description: 同步结果不对、报错、或者数据被改坏了
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！这个工具的问题九成出在**权限**和**路径**上，所以下面几项信息非常关键，
+        能省掉好几轮来回。
+
+        > 提交前请扫一眼你粘贴的内容，把书签标题里不想公开的私人链接删掉。
+        > GitHub 会自动把用户名之类的写成 `user`，但 `bmsync doctor` 的输出里可能有你的路径。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 你期望的结果，和实际看到的结果。
+      placeholder: |
+        我执行了 `bmsync sync`，期望……
+        实际却……
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: bmsync doctor 的输出
+      description: "在终端执行 `./bin/bmsync doctor`，把完整输出粘到这里。"
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: bmsync-version
+    attributes:
+      label: bmsync 版本
+      description: "`./bin/bmsync --version` 的输出。"
+      placeholder: "bmsync 1.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: fd-access
+    attributes:
+      label: 是否已授予「完全磁盘访问权限」
+      description: Safari 书签受 macOS TCC 保护，没有这个权限连读都读不到（`chmod`/`sudo` 无效）。
+      options:
+        - 已授予，doctor 里 Safari 显示「正常」
+        - 已授予，但 doctor 里 Safari 仍显示失败
+        - 没授予 / 不确定
+    validations:
+      required: true
+
+  - type: dropdown
+    id: direction
+    attributes:
+      label: 同步方向
+      options:
+        - 双向（默认 both）
+        - chrome2safari（单向）
+        - safari2chrome（单向）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: browsers-closed
+    attributes:
+      label: 同步时浏览器是否已退出
+      description: 浏览器运行时会用内存里的旧数据覆盖改动，这是"同步后看不到变化"的最常见原因。
+      options:
+        - 都已退出
+        - 浏览器开着，我加了 --force
+        - 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: 环境
+      placeholder: "macOS 26.6.1 / Python 3.9.6 / Chrome 141 / Safari 26"
+    validations:
+      required: true
+
+  - type: textarea
+    id: dry-run
+    attributes:
+      label: sync --dry-run -v 的输出（可选）
+      description: |
+        如果问题是"改动不符合预期"，这一项最有用——它列出将要执行的全部改动，且不会写任何文件。
+        执行后直接把输出粘过来即可（书签多的话截取和问题相关的部分就行）。
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息（可选）
+      description: |
+        比如：`state/bmsync.log` 里的相关记录、改成了什么配置、是否用过别的同步工具、
+        是否是首次同步 / 基线是否被删过。
+    validations:
+      required: false

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 先看常见问题（权限 / 路径 / 看不到变化）
+    url: https://github.com/Battle-l/bmsync/blob/main/README.md#7-出问题时
+    about: Safari 读不到、同步后浏览器里没变化、想回滚——这些在 README 里都有答案。
+  - name: 使用问题与讨论
+    url: https://github.com/Battle-l/bmsync/discussions
+    about: 不确定是不是 bug、想交流用法，可以到 Discussions（若未开启请直接开 Issue）。

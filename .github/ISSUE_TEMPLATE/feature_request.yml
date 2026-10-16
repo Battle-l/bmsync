@@ -1,0 +1,48 @@
+name: 功能建议
+description: 想要新能力、想支持别的浏览器、或者觉得某处体验不好
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎提建议！这个工具的目标很克制：**只做书签同步这一件事，并且做得可预测、可回滚**。
+        如果你的需求偏"顺带做点别的"，也欢迎先说，我们可以一起判断该不该进这个项目。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 先说场景和痛点，不用急着给方案——有时候问题描述清楚，方案会不一样。
+      placeholder: |
+        我有两台 Mac，各自的 Chrome 书签不一样，希望能……
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你设想的做法（可选）
+      description: 如果你已经有想法，说说看；命令行长什么样、配置怎么写。
+    validations:
+      required: false
+
+  - type: dropdown
+    id: willingness
+    attributes:
+      label: 你愿意自己提 PR 吗
+      description: 说"愿意"不代表必须做完，只是让我知道要不要把实现思路写详细一点。
+      options:
+        - 愿意，我可以试着实现
+        - 愿意，但需要指点一下从哪下手
+        - 我只是提需求，实现靠维护者
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 确认与项目定位不冲突
+      options:
+        - label: 这个需求只涉及书签同步（不涉及历史记录、密码、扩展等数据）
+          required: false

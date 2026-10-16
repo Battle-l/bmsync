@@ -194,7 +194,9 @@ bmsync/
 ├── bmsync.py                    # 全部实现，单文件，纯标准库
 ├── bin/bmsync                   # 启动器（可直接 ./bin/bmsync sync）
 ├── tests/test_bmsync.py         # 67 项端到端测试
-├── .github/workflows/tests.yml  # CI：macOS 上跑测试 + lint
+├── .github/
+│   ├── workflows/tests.yml      # CI：macOS 上跑测试 + lint
+│   └── ISSUE_TEMPLATE/          # Issue 模板（引导附带 doctor 输出）
 ├── CHANGELOG.md                 # 变更记录
 ├── pyproject.toml               # 元数据（运行不需要安装）
 └── state/                       # 运行时生成（已在 .gitignore 中）
