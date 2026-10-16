@@ -1,5 +1,9 @@
 # bmsync —— Chrome ↔ Safari 书签双向同步
 
+[![tests](https://github.com/Battle-l/bmsync/actions/workflows/tests.yml/badge.svg)](https://github.com/Battle-l/bmsync/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
+
 macOS 上的命令行工具，把 Chrome 和 Safari 的书签互相同步。纯 Python 标准库实现，**不需要安装任何依赖**。
 
 思路就是最直白的那套：**分别读出两边 → 比对出各自的改动 → 合并 → 分别写回**。区别在于它不生成中间文件再导入（那样每次都会重复导入），而是直接读写两个浏览器的原生书签库，并用一份"上次同步后的基线"记录状态，所以第二次同步只处理真正的增量，重复执行结果稳定。
