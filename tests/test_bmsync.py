@@ -648,6 +648,90 @@ def scenario_edge_cases(tmp: Path):
     check("两边都为空时不报错", proc.returncode == 0, proc.stderr.strip()[-300:])
 
 
+def scenario_global_flags(tmp: Path):
+    """
+    全局选项（-v / -vv / --json / --config）必须写在子命令前后都有效。
+
+    回归用例：这些选项原本只定义在主解析器上，argparse 解析完子命令后不会再回主解析器找参数，
+    于是 `bmsync sync -v` 直接报 "unrecognized arguments: -v"（README 里正是这么写的）。
+    """
+    print("\n[9] 全局选项的位置无关性")
+
+    # 9.1 纯解析层：不依赖沙盒，跑得快
+    cases = [
+        ([], 1, False), (["sync"], 1, False),
+        (["sync", "-v"], 2, False), (["-v", "sync"], 2, False),
+        (["sync", "-vv"], 3, False), (["-vv", "sync"], 3, False),
+        (["-v", "sync", "-v"], 3, False),
+        (["sync", "--verbose"], 2, False), (["--verbose", "sync"], 2, False),
+        (["sync", "--json"], 1, True), (["--json", "sync"], 1, True),
+        (["sync", "--dry-run", "-v"], 2, False),
+        (["sync", "--prefer", "safari", "-v"], 2, False),
+        (["export", "--out", "/tmp/x", "-v"], 2, False),
+        (["install-scheduler", "--interval", "30", "-v"], 2, False),
+        (["import", "f.html", "-v"], 2, False),
+    ]
+    bad = []
+    for argv, expect_v, expect_j in cases:
+        cleaned, opts = bmsync.preprocess_globals(argv)
+        if opts["verbose"] != expect_v or opts["json"] != expect_j:
+            bad.append("%s -> verbose=%s json=%s" % (" ".join(argv), opts["verbose"], opts["json"]))
+    check("全局选项在任意位置都被正确解析（%d 种组合）" % len(cases), not bad, "；".join(bad))
+
+    # --config 也要能从参数里摘出来，且剩余参数保持原样
+    cleaned, opts = bmsync.preprocess_globals(["--config", "/tmp/a.json", "sync", "--dry-run"])
+    check("--config 被摘出并保留其值", opts["config"] == "/tmp/a.json" and cleaned == ["sync", "--dry-run"],
+          "%r / %r" % (opts["config"], cleaned))
+    cleaned, opts = bmsync.preprocess_globals(["sync", "--config=/tmp/b.json", "-v"])
+    check("--config=路径 形式也支持", opts["config"] == "/tmp/b.json" and opts["verbose"] == 2,
+          "%r / %r" % (opts["config"], opts["verbose"]))
+    cleaned, opts = bmsync.preprocess_globals(["sync", "--", "-v"])
+    check("-- 之后的参数不被当成全局选项", cleaned == ["sync", "--", "-v"] and opts["verbose"] == 1,
+          "%r" % (cleaned,))
+
+    # 9.2 真实 CLI：README 里写的组合必须能跑通
+    sb = Sandbox(tmp / "flags")
+    sb.install_chrome(chrome_fixture([url_node("A", "https://a.example")]))
+    sb.install_safari(safari_fixture([leaf("B", "https://b.example")]))
+    sb.write_config()
+    invocations = [
+        ["sync", "--dry-run", "-v"],
+        ["-v", "sync", "--dry-run"],
+        ["sync", "-v", "--dry-run"],
+        ["sync", "--dry-run", "-vv"],
+        ["status", "-v"],
+        ["--config", str(sb.config), "sync", "--dry-run", "-v"],   # 全局选项在最前
+        ["sync", "--dry-run", "--config", str(sb.config), "-v"],   # 混在中间
+        ["sync", "--config=" + str(sb.config), "--dry-run"],       # --config=路径
+        ["export", "--out", str(tmp / "flags" / "out"), "-v"],     # 其它子命令也要支持
+    ]
+    failed = []
+    for argv in invocations:
+        # 除了显式带 --config 的那几条，其余统一走沙盒配置
+        full = list(argv) if "--config" in argv or any(a.startswith("--config=") for a in argv) \
+            else ["--config", str(sb.config)] + list(argv)
+        cmd = [sys.executable, str(SCRIPT)] + full
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        if "unrecognized arguments" in proc.stderr or proc.returncode != 0:
+            failed.append("%s (rc=%s: %s)" % (" ".join(full), proc.returncode,
+                                              proc.stderr.strip().splitlines()[-1][:80] if proc.stderr else ""))
+    check("README 里的命令都能跑通", not failed, "；".join(failed))
+
+    # 9.3 -v 增加详细程度，--json 输出机器可读结果（两种位置都验）
+    base = sb.run("sync", "--dry-run")
+    more = sb.run("sync", "--dry-run", "-v")
+    same = sb.run("-v", "sync", "--dry-run")
+    def count_lines(proc):
+        return len([ln for ln in proc.stdout.splitlines() if ln.strip()])
+
+    lines = count_lines
+    check("-v 确实让输出更详细", lines(more) > lines(base), "%d vs %d" % (lines(more), lines(base)))
+    check("-v 写在前后结果一致", lines(more) == lines(same), "%d vs %d" % (lines(more), lines(same)))
+    check("--json 写在子命令后有效", '"summary"' in sb.run("sync", "--dry-run", "--json").stdout)
+    check("--json 写在子命令前有效", '"summary"' in sb.run("--json", "sync", "--dry-run").stdout)
+
+
 def scenario_missing_permission(tmp: Path):
     """Safari 文件不可读时要给出明确的 TCC 提示，而不是一堆 traceback。"""
     print("\n[8] 权限缺失时的提示")
@@ -678,6 +762,7 @@ def main():
     scenario_one_way(base)
     scenario_export_import(base)
     scenario_edge_cases(base)
+    scenario_global_flags(base)
     scenario_missing_permission(base)
 
     print("\n" + "=" * 70)

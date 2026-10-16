@@ -39,7 +39,7 @@ python3 tests/test_bmsync.py     # 跑测试（不需要任何依赖）
 1. **测试全绿**：
 
    ```bash
-   python3 tests/test_bmsync.py          # 期望 "通过 58 项，失败 0 项"
+   python3 tests/test_bmsync.py          # 期望 "通过 67 项，失败 0 项"
    BMSYNC_TEST_CHROME=/nonexistent python3 tests/test_bmsync.py   # 合成夹具路径也要绿
    ```
 

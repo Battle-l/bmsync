@@ -14,7 +14,7 @@ Safari Bookmarks.plist ──┘   (基线 state.json)    └─→ 写回 Safar
 - 冲突按修改时间判定，并逐条打印冲突说明
 - 每次写入前自动备份两边原文件，随时可回滚
 - 支持 launchd 定时同步
-- 58 项端到端测试（含对真实 Chrome 书签的无损往返验证）
+- 67 项端到端测试（含对真实 Chrome 书签的无损往返验证）
 
 ---
 
@@ -69,6 +69,16 @@ Safari 的书签文件受 macOS 的 TCC 保护，`chmod`、`sudo` 都没用，�
 ./bin/bmsync import ~/Downloads/bookmarks.html   # 把外部导出的书签并进来，再同步到两边
 ./bin/bmsync init-config               # 生成可编辑的 config.json
 ```
+
+全局选项（`-v`、`-vv`、`--json` / `-t`、`--config`）写在**子命令前后都有效**，下面这些写法等价：
+
+```bash
+./bin/bmsync sync --dry-run -v
+./bin/bmsync -v sync --dry-run
+./bin/bmsync sync --dry-run --config ~/bm.json -v
+```
+
+`-v` 让输出更详细、`-vv` 在报错时额外打印 Python 调用栈（提 Issue 时附上它很有用）。
 
 **同步前请退出 Chrome 和 Safari。** 浏览器运行时会把内存里的旧数据写回磁盘，覆盖掉我们的改动。脚本会检测并拒绝执行（确认无碍时可加 `--force`）。
 
@@ -183,8 +193,9 @@ cp state/backups/chrome.20261016-195845.bak \
 bmsync/
 ├── bmsync.py                    # 全部实现，单文件，纯标准库
 ├── bin/bmsync                   # 启动器（可直接 ./bin/bmsync sync）
-├── tests/test_bmsync.py         # 58 项端到端测试
+├── tests/test_bmsync.py         # 67 项端到端测试
 ├── .github/workflows/tests.yml  # CI：macOS 上跑测试 + lint
+├── CHANGELOG.md                 # 变更记录
 ├── pyproject.toml               # 元数据（运行不需要安装）
 └── state/                       # 运行时生成（已在 .gitignore 中）
     ├── state.json               # 同步基线（谁改了什么全靠它）

@@ -1990,23 +1990,70 @@ def cmd_init_config(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------------------
 
 
+def preprocess_globals(argv: Sequence[str]) -> Tuple[List[str], Dict[str, Any]]:
+    """
+    把 -v/--verbose/--json/-t/--config 从参数里统一摘出来。
+
+    返回 (剩余参数, {"verbose": int, "json": bool, "config": str|None})。
+
+    为什么不在主解析器上直接定义：argparse 解析完子命令后不会再回主解析器找参数，所以
+    `sync -v`、`sync --config x.json` 这种写法会报 "unrecognized arguments"；而在主/子
+    解析器上各定义一份同名选项，又会在同一个 namespace 上互相覆盖取值（子解析器的 default
+    会盖掉主解析器已累计的结果，SUPPRESS 也不可靠）。所以这几个全局选项统一在这里处理，
+    写在子命令前后都有效。
+    """
+    rest: List[str] = []
+    opts: Dict[str, Any] = {"verbose": 1, "json": False, "config": None}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":                      # 之后的一律原样传递
+            rest.extend(argv[i:])
+            break
+        if arg in ("-t", "--json"):
+            opts["json"] = True
+        elif arg == "--verbose":
+            opts["verbose"] += 1
+        elif arg == "-v":
+            opts["verbose"] += 1
+        elif arg.startswith("-v") and not arg.startswith("--") and set(arg[1:]) == {"v"}:
+            opts["verbose"] += len(arg) - 1  # -vv / -vvv
+        elif arg == "--config" or (arg.startswith("--config=") and arg != "--config="):
+            if arg.startswith("--config="):
+                opts["config"] = arg.split("=", 1)[1]
+            else:
+                i += 1
+                if i >= len(argv):
+                    raise SystemExit("bmsync: 错误：--config 后面缺少文件路径")
+                opts["config"] = argv[i]
+        else:
+            rest.append(arg)
+        i += 1
+    return rest, opts
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bmsync", description="Chrome ↔ Safari 书签双向同步（macOS，仅用 Python 标准库）",
         epilog="推荐流程：bmsync doctor → bmsync sync --dry-run -v → bmsync sync")
     parser.add_argument("--version", action="version", version="bmsync %s" % __version__)
+    # --config / --json / -v 属于全局选项，写在子命令前后都允许，
+    # 由 preprocess_globals() 统一抽取后塞回 namespace（见 main）。这里只登记帮助文本。
     parser.add_argument("--config", help="配置文件路径（默认脚本目录或当前目录下的 config.json）")
-    parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
-    parser.add_argument("-v", "--verbose", action="count", default=1, help="更详细输出（可 -vv）")
+    parser.add_argument("--json", "-t", action="store_true", help="以 JSON 输出结果（可写在子命令后）")
+    parser.add_argument("-v", "--verbose", action="count", default=1, help="更详细输出（可 -vv，可写在子命令后）")
     sub = parser.add_subparsers(dest="command")
 
-    p = sub.add_parser("doctor", help="环境自检：权限、路径、进程、定时任务")
+    def new_sub(name: str, **kwargs: Any) -> argparse.ArgumentParser:
+        return sub.add_parser(name, **kwargs)
+
+    p = new_sub("doctor", help="环境自检：权限、路径、进程、定时任务")
     p.set_defaults(func=cmd_doctor)
 
-    p = sub.add_parser("status", help="查看两边书签数量与上次同步信息")
+    p = new_sub("status", help="查看两边书签数量与上次同步信息")
     p.set_defaults(func=cmd_status)
 
-    p = sub.add_parser("sync", help="执行同步（核心命令）")
+    p = new_sub("sync", help="执行同步（核心命令）")
     p.add_argument("--dry-run", "-n", action="store_true", help="只演练，不写任何文件")
     p.add_argument("--force", action="store_true", help="即使浏览器在运行也写入")
     p.add_argument("--prefer", choices=["newest", "chrome", "safari"], help="冲突时以哪边为准")
@@ -2016,13 +2063,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quiet", action="store_true", help="静默模式（定时任务用）")
     p.set_defaults(func=cmd_sync)
 
-    p = sub.add_parser("export", help="导出为 HTML（可手动导入）或 JSON")
+    p = new_sub("export", help="导出为 HTML（可手动导入）或 JSON")
     p.add_argument("--format", choices=["html", "json"], default="html")
     p.add_argument("--out", help="输出目录")
     p.add_argument("--browser", action="append", choices=["chrome", "safari"], help="只导出指定浏览器")
     p.set_defaults(func=cmd_export)
 
-    p = sub.add_parser("import", help="把外部书签文件并入后同步")
+    p = new_sub("import", help="把外部书签文件并入后同步")
     p.add_argument("file", help="HTML 或 JSON 书签文件")
     p.add_argument("--format", choices=["auto", "html", "json"], default="auto")
     p.add_argument("--dry-run", action="store_true")
@@ -2030,25 +2077,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-show", type=int, default=40)
     p.set_defaults(func=cmd_import)
 
-    p = sub.add_parser("init-config", help="生成可编辑的配置文件")
+    p = new_sub("init-config", help="生成可编辑的配置文件")
     p.add_argument("--out")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init_config)
 
-    p = sub.add_parser("install-scheduler", help="安装 launchd 定时同步任务")
+    p = new_sub("install-scheduler", help="安装 launchd 定时同步任务")
     p.add_argument("--interval", type=int, default=60, help="间隔分钟（默认 60，最小 5）")
     p.add_argument("--dry-run", "-n", action="store_true", help="只打印将要写入的 plist，不安装")
     p.set_defaults(func=cmd_install_scheduler)
 
-    p = sub.add_parser("uninstall-scheduler", help="移除定时同步任务")
+    p = new_sub("uninstall-scheduler", help="移除定时同步任务")
     p.set_defaults(func=cmd_uninstall_scheduler)
 
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    cleaned, globals_ = preprocess_globals(raw)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(cleaned)
+    args.verbose = globals_["verbose"]
+    args.json = globals_["json"]
+    if globals_["config"] is not None:
+        args.config = globals_["config"]
     if not getattr(args, "command", None):
         parser.print_help()
         return 1
