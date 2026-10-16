@@ -991,6 +991,161 @@ def tree_from_state(base: Dict[str, Any]) -> Tree:
     return tree
 
 
+def resolve_scope_folder(tree: Tree, scope: str) -> Optional[str]:
+    """把 "书签栏/同步" 这样的路径解析成树里的目录 id；找不到返回 None。"""
+    parts = [p for p in str(scope).split("/") if p.strip()]
+    if not parts:
+        return None
+    label_to_id = {v: k for k, v in CONTAINER_LABELS.items()}
+    head = label_to_id.get(parts[0].strip())
+    if head is None:
+        # 也允许只写容器名（中文标签）或直接写目录名（在所有容器里找同名顶层目录）
+        for cid in CONTAINERS:
+            found = tree.find_id(cid, "folder", parts[0].strip(), None)
+            if found:
+                head = cid
+                break
+        if head is None:
+            return None
+    cursor: Optional[str] = head
+    for part in parts[1:]:
+        if cursor is None:
+            return None
+        cursor = tree.find_id(cursor, "folder", part.strip(), None)
+    return cursor
+
+
+def scoped_clone(tree: Tree, folder_id: Optional[str], name: str = "同步") -> Tree:
+    """
+    只保留 scope 目录（含）以下的内容，并把该目录本身作为根。
+
+    注意：这一侧**没有**该目录时要返回"只含该目录的空树"，而不是整棵树的副本 ——
+    否则范围外的全部内容都会被当成"范围内"，范围同步就形同虚设。
+    """
+    if folder_id is None:
+        return tree.clone()
+    if folder_id not in tree.items:
+        empty = Tree()
+        empty.add(Item(id=folder_id, kind="folder", name=name, parent_id=ROOT_ID))
+        empty.children[ROOT_ID] = [folder_id]
+        return empty
+    out = Tree()
+    is_root = True
+    for item_id in tree.subtree_ids(folder_id):
+        if item_id not in tree.items:
+            continue
+        item = tree.items[item_id]
+        if is_root:
+            # 把这层目录当成根：parent 置空，id 用回它自己的 id（便于写回时定位）
+            out.add(Item(id=item_id, kind="folder", name=item.name, parent_id=ROOT_ID,
+                         mtime=item.mtime))
+            out.children[ROOT_ID] = [item_id]
+            is_root = False
+            continue
+        out.add(Item(id=item_id, kind=item.kind, name=item.name, parent_id=item.parent_id,
+                     url=item.url, mtime=item.mtime))
+    if is_root:                      # 空目录
+        out.add(Item(id=folder_id, kind="folder", name=tree.items[folder_id].name,
+                     parent_id=ROOT_ID))
+        out.children[ROOT_ID] = [folder_id]
+    return out
+
+
+def ensure_scope_folder(target: Tree, folder_id: str, name: str) -> Tree:
+    """目标树里没有这个 scope 目录时补出来（按路径 id 落在容器下），保证写回有落点。"""
+    if folder_id in target.items:
+        return target
+    out = target.clone()
+    container = BAR_ID if folder_id.startswith("f:%s/" % BAR_ID) else OTHER_ID
+    if container not in out.items:
+        out.add(Item(id=container, kind="folder", name=container, parent_id=ROOT_ID))
+    out.add(Item(id=folder_id, kind="folder", name=name, parent_id=container, mtime=None))
+    return out
+
+
+def assemble_for_browser(original: Tree, merged: Tree, folder_id: str, name: str = "同步") -> Tree:
+    """
+    为某个浏览器组装"最终应写入的完整树"：
+      - 范围内（scope 目录内部）：用合并结果
+      - 范围外：保留**该浏览器自己**的内容，一格不动
+
+    不能两边共用同一棵树：合并结果里的范围外部分来自 Chrome，直接写给 Safari 会让
+    Safari 把它自己范围外的书签当成"多余项"删掉（实测发生过）。
+
+    实现上只替换 scope 目录的子节点，其余原样保留 —— 不要"摘掉目录再挂回"，
+    那样很容易把目录从父节点的子项列表里弄丢（踩过一次）。
+    """
+    out = original.clone()
+    if folder_id not in out.items:
+        out = ensure_scope_folder(out, folder_id, name)
+    # 清掉该目录原有的内容
+    for item_id in list(original.subtree_ids(folder_id)):
+        if item_id == folder_id:
+            continue
+        out.items.pop(item_id, None)
+        out.children.pop(item_id, None)
+    out.children[folder_id] = []
+    # 挂上合并结果里该目录的内容
+    if folder_id in merged.items:
+        for item_id in merged.children_of(folder_id):
+            if item_id in merged.items:
+                _add_subtree(out, merged, item_id, folder_id)
+    return out
+
+
+def splice_scoped_into(target: Tree, scoped: Tree, folder_id: str) -> Tree:
+    """
+    把 scope 合并结果写回完整树：只替换该目录的子节点，容器与其它内容原样保留。
+    """
+    if folder_id not in target.items:
+        target.add(Item(id=folder_id, kind="folder", name=scoped.items[folder_id].name
+                        if folder_id in scoped.items else "同步",
+                        parent_id=OTHER_ID, mtime=None))
+    merged = target.clone()
+    # 清掉该目录原有的整棵子树
+    for item_id in target.subtree_ids(folder_id):
+        if item_id == folder_id:
+            continue
+        merged.items.pop(item_id, None)
+        merged.children.pop(item_id, None)
+    merged.children[folder_id] = []
+    # 把 scoped 里该目录的内容挂回来
+    for item_id in scoped.subtree_ids(folder_id):
+        if item_id == folder_id or item_id not in scoped.items:
+            continue
+        item = scoped.items[item_id]
+        merged.add(Item(id=item_id, kind=item.kind, name=item.name, parent_id=item.parent_id,
+                        url=item.url, mtime=item.mtime))
+    if folder_id in scoped.items:
+        cur = target.items[folder_id]
+        merged.items[folder_id] = replace(cur, name=scoped.items[folder_id].name)
+    return merged
+
+
+def looks_flattened(current: Tree, base: Tree) -> Tuple[bool, str]:
+    """
+    识别"目录结构被抹平"：书签数量大致不变，但目录层数/数量明显减少。
+
+    这是 iOS Safari 往返的典型特征：iOS 上不显示第一级目录、内容直接铺开，
+    再经 iCloud 回到 macOS 时目录就没了。此时若按普通规则同步，那些"消失的目录"
+    会被当成删除，连目录里的书签一起删掉（真实事故就是这样丢了 368 条）。
+    """
+    cur_folders = [i for i, it in current.items.items() if it.kind == "folder" and i not in CONTAINERS]
+    base_folders = [i for i, it in base.items.items() if it.kind == "folder" and i not in CONTAINERS]
+    cur_books = sum(1 for it in current.items.values() if it.kind == "bookmark")
+    base_books = sum(1 for it in base.items.values() if it.kind == "bookmark")
+    lost = [i for i in base_folders if i not in current.items]
+    if len(lost) < 3:
+        return False, ""
+    if len(lost) < max(3, int(len(base_folders) * 0.3)):
+        return False, ""
+    # 书签数量明显减少 → 更可能是真的批量删除，交给删除熔断处理，不在这里拦
+    if cur_books < base_books * 0.9:
+        return False, ""
+    return True, ("目录数量从 %d 降到 %d（少了 %d 个），但书签数量基本没变（%d → %d）"
+                  % (len(base_folders), len(cur_folders), len(lost), base_books, cur_books))
+
+
 def detect_changes(current: Tree, base: Tree, side: str) -> Dict[str, Change]:
     """当前树 vs 基线：找出这一侧真实的增 / 改 / 删。"""
     changes: Dict[str, Change] = {}
@@ -1077,6 +1232,7 @@ def _add_subtree(dst: Tree, src: Tree, item_id: str, new_parent: Optional[str]) 
 def merge(base: Tree, chrome_tree: Tree, safari_tree: Tree, prefer: str = "newest",
           extra_sources: Optional[Dict[str, Tree]] = None,
           max_delete_ratio: float = 0.05, max_delete_count: int = 10,
+          no_delete: bool = False, scope_anchor: Optional[str] = None,
           verbose: int = 0) -> MergeResult:
     """
     三方合并：
@@ -1159,6 +1315,12 @@ def merge(base: Tree, chrome_tree: Tree, safari_tree: Tree, prefer: str = "newes
     # 一次故障变成两边全灭（实际发生过：Safari 文件被重写后，Chrome 被删到只剩 8 条）。
     # 因此单次同步的删除量设上限：超过就整体拒绝删除，只做新增/修改，并留下明确告警。
     delete_ids = [i for i, d in actions.items() if d == "delete"]
+    if delete_ids and no_delete:
+        result.blocked_deletes = len(delete_ids)
+        result.conflicts.append(
+            "已开启 no_delete：本次 %d 条删除被全部忽略，只执行新增/修改（可在配置里关掉）"
+            % len(delete_ids))
+        actions = {k: v for k, v in actions.items() if v != "delete"}
     baseline_size = max(1, sum(1 for v in base.items.values() if v.kind == "bookmark"))
     ratio_limit = float(max_delete_ratio or 0)
     count_limit = int(max_delete_count or 0)
@@ -1196,7 +1358,10 @@ def merge(base: Tree, chrome_tree: Tree, safari_tree: Tree, prefer: str = "newes
             continue
         parent = item.parent_id
         if parent is not None and parent not in merged.items:
-            parent = OTHER_ID if OTHER_ID in merged.items else None
+            # 限定范围同步时，"无父可依"的条目必须留在范围内，
+            # 否则会被塞进容器（书签栏/其他书签）里 —— 那就越界了
+            parent = scope_anchor if (scope_anchor and scope_anchor in merged.items) else (
+                OTHER_ID if OTHER_ID in merged.items else None)
         if item_id in merged.items:
             # 保留原节点，只更新名称 / 地址（移动走 _set_parent）
             cur = merged.items[item_id]
@@ -1297,6 +1462,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "backup_min_interval": 300,   # 距上次备份不足这么多秒且"实质内容"没变，就不新增备份
         "max_delete_ratio": 0.05,     # 单次同步最多允许删除的比例（超过则熔断，保护数据）
         "max_delete_count": 10,       # 单次同步最多允许删除的绝对条数（与比例取较大者）
+        "scope": "",                  # 只同步这个目录（如 "书签栏/同步"）；空 = 整个书签树
+        "no_delete": False,           # true = 永不删除，只做新增/修改（最保守）
         "require_browsers_closed": True,
     },
     "state_dir": str(APP_DIR / "state"),
@@ -2176,16 +2343,90 @@ def run_sync(cfg: Dict[str, Any], chrome: ChromeBackend, safari: SafariBackend, 
             if item_id not in left.items:
                 _add_subtree(left, chrome_tree, item_id, chrome_tree.items[item_id].parent_id)
 
-    # 5) 合并
+    # 5) 合并（可限定在某个目录内进行）
+    scope = (getattr(args, "scope", None) or cfg["sync"].get("scope") or "").strip()
+    no_delete = bool(cfg["sync"].get("no_delete")) or bool(getattr(args, "no_delete", False))
+    scope_ids: Dict[str, Optional[str]] = {"chrome": None, "safari": None}
+    scope_first = False
+    scope_write_trees: Dict[str, Tree] = {}
+    if scope:
+        scope_ids["chrome"] = resolve_scope_folder(chrome_tree, scope)
+        scope_ids["safari"] = resolve_scope_folder(safari_tree, scope)
+        if scope_ids["chrome"] is None and scope_ids["safari"] is None:
+            eprint("[错误] 两侧都找不到目录「%s」。请先在两个浏览器里建好同名目录，"
+                   "或用 --scope 指定正确的路径（如 \"书签栏/同步\"）。" % scope)
+            return 2
+        log("同步范围：%s（Chrome %s / Safari %s）" % (
+            scope,
+            "已找到" if scope_ids["chrome"] else "待创建",
+            "已找到" if scope_ids["safari"] else "待创建"), verbose)
+        # 两侧都挂到同一个锚点 id 上，便于合并与写回
+        anchor = scope_ids["chrome"] or scope_ids["safari"]
+        scope_ids["chrome"] = anchor
+        scope_ids["safari"] = anchor
+        left = scoped_clone(left, anchor)
+        right = scoped_clone(right, anchor)
+        # scope 变化（或首次启用）时，用当前内容重建基线，避免把范围外的东西当成被删
+        scope_first = state.get("scope") != scope or not state.get("base", {}).get("items")
+        if scope_first:
+            base = Tree()
+            base.add(Item(id=anchor, kind="folder",
+                          name=(chrome_tree.items.get(anchor) or safari_tree.items.get(anchor)).name
+                          if (anchor in chrome_tree.items or anchor in safari_tree.items) else "同步",
+                          parent_id=ROOT_ID))
+            base.children[ROOT_ID] = [anchor]
+            # 把 scope 目录本身及其现有内容作为基线；左右两边内容都并入，
+            # 这样第一轮只会"补齐缺失"，不会把范围外的东西带进来
+            for src in (left, right):
+                for kid in src.children_of(anchor):
+                    if kid in src.items and kid not in base.items:
+                        _add_subtree(base, src, kid, anchor)
+            log("首次在该范围内同步：以两侧并集建立基线，本轮不推断删除", verbose)
+        state["scope"] = scope
+
+    # 结构抹平检测：iOS 往返会把目录抹掉，此时绝不能把"目录消失"当成删除
+    if not getattr(args, "allow_flatten", False):
+        for side, tree in (("Chrome", left), ("Safari", right)):
+            flat, why = looks_flattened(tree, base)
+            if flat:
+                no_delete = True
+                msg = ("⚠️ 检测到 %s 的目录结构疑似被抹平（%s）。本轮**不执行任何删除**，"
+                       "只做新增/修改。这通常是 iOS Safari 往返或 iCloud 同步造成的，"
+                       "不是你真的删了目录。确认要按现状同步请加 --allow-flatten。" % (side, why))
+                eprint(msg)
+                log("  " + msg, verbose)
+                append_log(sp, ["[%s] %s" % (fmt_ts(now_ts()), msg)])
+                break
+
+    # 范围首次播种时不能推断删除：基线刚由两侧并集建立，"某一侧没有"只说明还没同步过去，
+    # 不代表用户删除（否则会把仅存在于另一侧的书签当删除处理）
+    seed_no_delete = bool(scope) and scope_first
     result = merge(base, left, right, prefer=prefer, extra_sources=extra_sources,
                    max_delete_ratio=float(cfg["sync"].get("max_delete_ratio", 0.05) or 0),
                    max_delete_count=int(cfg["sync"].get("max_delete_count", 10) or 0),
+                   no_delete=(no_delete or seed_no_delete),
+                   scope_anchor=(scope_ids.get("chrome") if scope else None),
                    verbose=verbose)
     merged = result.merged
     counts = {side: Counter(c.kind for c in changes) for side, changes in result.changes.items()}
     plan = {"chrome": plan_changes(merged, chrome_tree), "safari": plan_changes(merged, safari_tree)}
 
+    if scope:
+        # 合并只在 scope 内进行，写回前拼回完整树：容器与范围外的内容原样不动
+        anchor = scope_ids["chrome"]
+        if anchor:
+            scope_name = (result.merged.items.get(anchor).name
+                          if anchor in result.merged.items else "同步")
+            write_chrome = assemble_for_browser(chrome_tree, result.merged, anchor, scope_name)
+            write_safari = assemble_for_browser(safari_tree, result.merged, anchor, scope_name)
+            # 两侧各自的写盘树（范围外保留各自原样）
+            scope_write_trees = {"chrome": write_chrome, "safari": write_safari}
+            merged = write_chrome           # merged 仍用于状态与计划展示
+        plan = {"chrome": plan_changes(write_chrome if anchor else merged, chrome_tree),
+                "safari": plan_changes(write_safari if anchor else merged, safari_tree)}
+
     summary = {
+        "scope": scope, "no_delete": no_delete,
         "chrome_add": counts["chrome"].get("add", 0), "chrome_upd": counts["chrome"].get("update", 0),
         "chrome_del": counts["chrome"].get("delete", 0),
         "safari_add": counts["safari"].get("add", 0), "safari_upd": counts["safari"].get("update", 0),
@@ -2273,10 +2514,11 @@ def run_sync(cfg: Dict[str, Any], chrome: ChromeBackend, safari: SafariBackend, 
                     # 此时若再去改 Bookmarks 文件，会和扩展互相覆盖（Chrome 的内存内容最终胜出）。
                     log("  Chrome 写入：交给 Chrome 扩展（桥接在线，直接改文件会被浏览器覆盖）", verbose)
                 else:
-                    steps_c = chrome.write_tree(merged, chrome.build_native_map(chrome.read_raw(), merged))
+                    tree_c = scope_write_trees.get("chrome", merged)
+                    steps_c = chrome.write_tree(tree_c, chrome.build_native_map(chrome.read_raw(), tree_c))
                     log("  Chrome 写入：%s" % ("；".join(steps_c) or "无变化"), verbose)
             if direction != "safari2chrome":
-                steps_s = safari.write_tree(merged)
+                steps_s = safari.write_tree(scope_write_trees.get("safari", merged))
                 log("  Safari 写入：%s" % ("；".join(steps_s) or "无变化"), verbose)
         except Exception:
             eprint("[错误] 写入失败，原文件已备份在：%s" % sp["backups"])
@@ -3353,6 +3595,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quiet", action="store_true", help="静默模式（定时任务用）")
     p.add_argument("--allow-mass-delete", action="store_true",
                    help="允许单次删除大量书签（默认熔断，需要显式确认）")
+    p.add_argument("--scope", metavar="目录",
+                   help='只同步这个目录（如 "书签栏/同步"）；两侧需有同名目录，默认整个书签树')
+    p.add_argument("--no-delete", action="store_true",
+                   help="本次同步不删除任何书签，只做新增/修改（最保守）")
+    p.add_argument("--allow-flatten", action="store_true",
+                   help="目录结构疑似被抹平时也按现状同步（默认拒绝删除）")
     p.set_defaults(func=cmd_sync)
 
     p = new_sub("export", help="导出为 HTML（可手动导入）或 JSON")

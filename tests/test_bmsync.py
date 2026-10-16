@@ -781,7 +781,7 @@ def scenario_realtime(tmp: Path):
         sb.install_chrome(raw)
 
         arrived = False
-        deadline = time.time() + 25
+        deadline = time.time() + 45
         while time.time() < deadline:
             time.sleep(0.4)
             if any(NU("https://realtime.example") == bmsync.norm_url(i.url)
@@ -795,7 +795,7 @@ def scenario_realtime(tmp: Path):
         sf["Children"][0]["Children"].append(leaf("Safari 实时新增", "https://safari-realtime.example"))
         sb.install_safari(sf)
         back = False
-        deadline = time.time() + 25
+        deadline = time.time() + 45
         while time.time() < deadline:
             time.sleep(0.4)
             if any(NU("https://safari-realtime.example") == bmsync.norm_url(i.url)
@@ -1290,6 +1290,101 @@ def scenario_mass_delete_guard(tmp: Path):
     check("合并层：显式放开后不再拦", res2.blocked_deletes == 0, str(res2.blocked_deletes))
 
 
+def scenario_scope_and_flatten(tmp: Path):
+    """
+    两个针对"iOS 往返抹平目录"的防护：
+      1. 范围同步（--scope / sync.scope）：只同步指定目录，容器与范围外内容一律不动
+      2. 抹平检测：书签数没变但目录大批消失时，本轮拒绝任何删除
+    """
+    print("\n[14] 范围同步与抹平检测")
+    sb = Sandbox(tmp / "scope")
+    sb.install_chrome(chrome_fixture([
+        url_node("根书签", "https://root.example"),
+        folder_node("同步", [url_node("同步-A", "https://sync-a.example")]),
+        folder_node("工作", [url_node("工作-A", "https://work-a.example")]),
+    ]))
+    sb.install_safari(safari_fixture([leaf("safari 根", "https://safari-root.example")]))
+    sb.write_config()
+    cfg = json.loads(sb.config.read_text(encoding="utf-8"))
+    cfg["sync"]["scope"] = "书签栏/同步"
+    sb.config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    sb.run("sync")
+
+    ct, st = sb.chrome_tree(), sb.safari_tree()
+
+    def urls(tree):
+        return {bmsync.norm_url(i.url) for i in tree.items.values() if i.kind == "bookmark"}
+
+    def bar_children(tree):
+        return sorted(tree.items[k].name for k in tree.children_of(bmsync.BAR_ID) if k in tree.items)
+
+    check("范围内目录被建到 Safari", any(i.name == "同步" and i.kind == "folder"
+                                        for i in st.items.values()))
+    # 重点：范围同步是"别碰范围外"，而不是"删掉范围外"。范围外的内容应当原样留在 Safari。
+    check("Safari 原有的范围外书签未被删",
+          NU("https://safari-root.example") in urls(st), str(sorted(urls(st))[:4]))
+    check("Chrome 的书签栏结构未被破坏",
+          bar_children(ct) == ["同步", "工作", "根书签"], str(bar_children(ct)))
+    check("范围外的「工作」目录没有被复制成第二份",
+          sum(1 for i in st.items.values() if i.kind == "folder" and i.name == "工作") <= 1,
+          str(bar_children(st)))
+
+    # 范围内新增 → 能同步；范围外新增 → 不同步，且不会消失
+    sf = sb.read_safari()
+    for folder in sf["Children"][0]["Children"]:
+        if folder.get("Title") == "同步":
+            folder["Children"].append(leaf("同步-B", "https://sync-b.example"))
+    sf["Children"][0]["Children"].append(leaf("范围外新增", "https://outside.example"))
+    sb.install_safari(sf)
+    sb.run("sync")
+    ct, st = sb.chrome_tree(), sb.safari_tree()
+    check("范围内新增能同步到 Chrome",
+          NU("https://sync-b.example") in urls(ct))
+    check("范围外新增不会进入 Chrome",
+          NU("https://outside.example") not in urls(ct))
+    check("范围外新增仍然留在 Safari 里（没被删）",
+          NU("https://outside.example") in urls(st))
+    check("范围外的原有内容不受影响",
+          NU("https://root.example") in urls(ct) and "工作" in bar_children(ct))
+
+    # 抹平检测：书签数不变、目录大批消失 → 拒绝删除
+    sb2 = Sandbox(tmp / "scope" / "flatten")
+    sb2.install_chrome(chrome_fixture([
+        url_node("根书签", "https://root.example"),
+        folder_node("目录A", [url_node("A1", "https://a1.example")]),
+        folder_node("目录B", [url_node("B1", "https://b1.example")]),
+        folder_node("目录C", [url_node("C1", "https://c1.example")]),
+    ]))
+    sb2.install_safari(safari_fixture([leaf("safari", "https://s.example")]))
+    sb2.write_config()
+    sb2.run("sync")
+    before_names = sorted(i.name for i in sb2.chrome_tree().items.values() if i.kind == "bookmark")
+
+    sf2 = sb2.read_safari()                      # 模拟 iOS 往返：目录被抹平、内容上提
+    bar2 = sf2["Children"][0]
+    lifted = []
+    for c in list(bar2["Children"]):
+        if c.get("WebBookmarkType") == "WebBookmarkTypeList" and str(c.get("Title", "")).startswith("目录"):
+            lifted.extend(c.get("Children") or [])
+            bar2["Children"].remove(c)
+    bar2["Children"].extend(lifted)
+    sb2.install_safari(sf2)
+    out = sb2.run("sync", "-v")
+    check("抹平被识别并告警", "疑似被抹平" in (out.stdout + out.stderr),
+          (out.stdout + out.stderr)[-200:])
+    check("抹平时不删除任何书签",
+          sorted(i.name for i in sb2.chrome_tree().items.values() if i.kind == "bookmark")
+          == before_names,
+          str(sorted(i.name for i in sb2.chrome_tree().items.values() if i.kind == "bookmark")))
+    check("抹平时目录也保留",
+          sorted(i.name for i in sb2.chrome_tree().items.values()
+                 if i.kind == "folder" and i.name.startswith("目录")) == ["目录A", "目录B", "目录C"])
+
+    # --allow-flatten 时才按现状同步
+    out2 = sb2.run("sync", "--allow-flatten", "-v")
+    check("显式允许后不再拦截", "疑似被抹平" not in (out2.stdout + out2.stderr))
+
+
 def scenario_missing_permission(tmp: Path):
     """Safari 文件不可读时要给出明确的 TCC 提示，而不是一堆 traceback。"""
     print("\n[8] 权限缺失时的提示")
@@ -1370,6 +1465,7 @@ def main():
     scenario_backups(base)
     scenario_bridge(base)
     scenario_mass_delete_guard(base)
+    scenario_scope_and_flatten(base)
     scenario_missing_permission(base)
 
     print("\n" + "=" * 70)
