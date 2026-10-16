@@ -1180,7 +1180,7 @@ def scenario_bridge(tmp: Path):
     # 12.6 扩展文件齐全且 JSON 合法
     ext = HERE.parent / "extension"
     for name in ("manifest.json", "background.js", "core.js", "popup.html", "popup.js",
-                 "test_core.mjs", "test_background.mjs"):
+                 "test_core.mjs", "test_background.mjs", "test_popup.mjs"):
         check("扩展文件存在：%s" % name, (ext / name).exists())
     manifest = json.loads((ext / "manifest.json").read_text(encoding="utf-8"))
     check("扩展用 mv3 且只申请 bookmarks 权限",
@@ -1199,7 +1199,8 @@ def scenario_bridge(tmp: Path):
         print("  ⤵ 未安装 node，跳过扩展单测（有 node 的机器上会执行）")
     else:
         for script, label in (("test_core.mjs", "扩展核心逻辑单测（含英文界面场景）"),
-                              ("test_background.mjs", "扩展后台脚本单测（应用/状态/最近变动）")):
+                              ("test_background.mjs", "扩展后台脚本单测（应用/状态/最近变动）"),
+                              ("test_popup.mjs", "扩展弹窗单测（module 加载/元素 id/渲染）")):
             run_node = subprocess.run([node, str(ext / script)], capture_output=True, text=True)
             check(label, run_node.returncode == 0, (run_node.stdout or run_node.stderr)[-300:])
 

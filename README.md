@@ -184,6 +184,7 @@ extension/
 ├── core.js          # 应用改动的核心逻辑（与 chrome API 解耦）
 ├── test_core.mjs    # node extension/test_core.mjs 自测核心逻辑
 ├── test_background.mjs  # node extension/test_background.mjs 自测后台脚本
+├── test_popup.mjs       # node extension/test_popup.mjs 自测弹窗（module 加载/元素 id/渲染）
 ├── background.js    # 定时向本地桥接拉取"要新增/删除什么"，用官方 API 应用
 ├── popup.html/js    # 点扩展图标看：连接状态、待应用改动、最近变动
 ```
@@ -199,7 +200,9 @@ extension/
 4. 在终端运行 `./bin/bmsync watch`（或 `watch-daemon start`）
 5. 点扩展图标，看到 **已连接** 就生效了
 
-> 更新过扩展代码后，需要到 `chrome://extensions` 点一下这个扩展的**刷新**按钮重新加载。
+> 更新过扩展代码后，需要到 `chrome://extensions` 点一下这个扩展的**刷新**按钮重新加载
+> —— 弹窗和后台脚本都是 ES module，改动后不刷新会继续跑旧代码（表现为弹窗报
+> `BmsyncCore is not defined` 之类的错误）。
 
 **弹窗里能看到什么**（点扩展图标）：
 

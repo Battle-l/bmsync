@@ -45,6 +45,18 @@
 - **安装后立即触发一次并回报退出码**（`--no-verify` 可关闭），按退出码给出处置建议，
   并自动带出日志最后几行。
 
+### 修复（弹窗报 BmsyncCore is not defined / textContent of null）
+
+- **`popup.html` 改用 `<script type="module">` 加载 `popup.js`，并让 `popup.js`
+  显式 `import * as BmsyncCore from './core.js'`**：core.js 已改为 ES module（只 export、
+  不再挂全局），而弹窗仍是普通 script 且从未加载 core.js，于是报 `BmsyncCore is not defined`；
+  紧接着的 DOM 取值失败又报 `Cannot set properties of null`
+- 弹窗内所有 DOM 取值改为空安全（元素缺失时静默跳过，不会整片空白），
+  并在 `DOMContentLoaded` 后再渲染
+- 新增 `test_popup.mjs`（4 项）：校验脚本以 module 加载、确实 import 了 core.js、
+  **js 里引用的元素 id 都在 html 中存在**、以及用最小 DOM/chrome 模拟真实加载一次弹窗并断言渲染结果
+- 验证过该测试能抓住这次回归（把 html 改回普通 script 时会失败）
+
 ### 新增（弹窗显示最近变动）
 
 - 桥接新增 **`GET /recent`**：返回待应用改动 + 同步历史（每次增删改数量）+ 扩展回报记录
