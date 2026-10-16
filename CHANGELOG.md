@@ -55,6 +55,17 @@
 - 基线改为**按内容指纹取交集**：只有两个浏览器都确实拿到的条目才记为已同步。
   未落地的改动会在下一轮重试（新增是幂等的），绝不会被误判成删除
 
+### 改进（不再因日常浏览而空转同步）
+
+- 实时同步的触发条件从「文件 mtime 变化」改为「**书签实质内容变化**」：
+  切标签页、Chrome 更新 checksum、系统重写 Safari plist 都会让文件变化但书签没变，
+  这类噪音现在会被静默跳过（`-vv` 下显示累计次数），不再触发同步
+- `content_fingerprint()` 同时支持 Chrome 的 JSON 与 Safari 的 plist，
+  忽略 `checksum` / `date_last_used` / `WebBookmarkModificationDate` / `WebBookmarkSyncData` 等易变字段
+- 带缓存的 `file_content_fingerprint()`：先比 `(size, mtime)`，未变则复用上次结果，避免每次轮询都解析整份文件
+- 修复期间发现的一个自引入 bug：噪音分支提前更新了"已见指纹"，导致静默计时被反复重置、
+  真正的变化永远触发不了（已加回归测试锁住"噪音不触发 + 真变化必触发"两个方向）
+
 ### 改进（备份策略）
 
 - **按内容去重**：忽略 `checksum` / `date_last_used` 等易变字段，内容没变不再重复备份

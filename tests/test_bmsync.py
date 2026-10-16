@@ -818,6 +818,76 @@ def scenario_realtime(tmp: Path):
     once = sb.run("watch", "--once", "0.8", expect=0)
     check("watch --once 会自行结束", once.returncode == 0, str(once.returncode))
 
+    # 10.5 内容指纹：浏览器重写文件但书签没变时不该触发同步（切换标签页就会这样）
+    f = sb.chrome_bookmarks
+    raw = json.loads(f.read_text(encoding="utf-8"))
+    fp_before = bmsync.content_fingerprint(f.read_bytes())
+    raw["checksum"] = "a" * 32
+    raw["roots"]["bookmark_bar"]["children"][0]["date_last_used"] = "999"
+    f.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    check("只改 checksum / date_last_used → 内容指纹不变",
+          bmsync.content_fingerprint(f.read_bytes()) == fp_before)
+    raw = json.loads(f.read_text(encoding="utf-8"))
+    raw["roots"]["bookmark_bar"]["children"].append(url_node("真新增", "https://really-new.example"))
+    f.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    check("真的加了书签 → 内容指纹改变",
+          bmsync.content_fingerprint(f.read_bytes()) != fp_before)
+
+    # Safari 的 plist 被系统周期性重写（只改 ModificationDate）也一样不该触发
+    sf_raw = sb.read_safari()
+    sf_fp = bmsync.content_fingerprint(sb.safari_path.read_bytes())
+    sf_raw["Children"][0]["WebBookmarkModificationDate"] = 12345678.0
+    sb.install_safari(sf_raw)
+    check("Safari 只改 ModificationDate → 内容指纹不变",
+          bmsync.content_fingerprint(sb.safari_path.read_bytes()) == sf_fp)
+
+    # 端到端：噪音不触发同步，真变化仍然触发
+    sb2 = Sandbox(tmp / "watch" / "noise")
+    sb2.install_chrome(chrome_fixture([url_node("A", "https://a.example")]))
+    sb2.install_safari(safari_fixture([leaf("B", "https://b.example")]))
+    sb2.write_config()
+    cfg2 = json.loads(sb2.config.read_text(encoding="utf-8"))
+    cfg2["watch"] = {"interval": 0.3, "settle": 0.5, "resync_after": 120, "bridge_port": 0}
+    sb2.config.write_text(json.dumps(cfg2, ensure_ascii=False), encoding="utf-8")
+    sb2.run("sync")
+    log_file = sb2.state_dir / "bmsync.log"
+    proc = subprocess.Popen(
+        [sys.executable, str(SCRIPT), "--config", str(sb2.config), "watch", "--no-initial"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    try:
+        time.sleep(1.2)
+        mark = len(log_file.read_text(encoding="utf-8").splitlines())
+        for i in range(6):                      # 模拟切标签页：文件被重写但书签没变
+            raw = json.loads(sb2.chrome_bookmarks.read_text(encoding="utf-8"))
+            raw["checksum"] = "%032x" % (i + 1)
+            sb2.chrome_bookmarks.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+            time.sleep(0.4)
+        time.sleep(1.2)
+        noise_syncs = [ln for ln in log_file.read_text(encoding="utf-8").splitlines()[mark:]
+                       if "开始同步" in ln]
+        check("噪音重写（切换标签页）不触发同步", len(noise_syncs) == 0,
+              "触发了 %d 次" % len(noise_syncs))
+
+        raw = json.loads(sb2.chrome_bookmarks.read_text(encoding="utf-8"))
+        raw["roots"]["bookmark_bar"]["children"].append(url_node("真新增", "https://real-noise-test.example"))
+        sb2.chrome_bookmarks.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        arrived = False
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            time.sleep(0.4)
+            if any("real-noise-test.example" in (i.url or "") for i in sb2.safari_tree().items.values()):
+                arrived = True
+                break
+        check("噪音之后真正的变化仍能同步", arrived)
+    finally:
+        proc.terminate()
+        try:
+            proc.communicate(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+
     # 10.55 浏览器在跑时的风险提示（实时模式没法"拒绝同步"，但必须说清覆盖风险）
     if bmsync.is_process_running(["python3", "python3.14", "python"]) is None:
         print("  ⤵ 进程检测不可用（沙盒里 ps 被禁用），跳过这两项——在你自己的终端里会执行")

@@ -1495,29 +1495,88 @@ def prune_backups(backups_dir: Path, tag: str, keep: int = 20) -> List[str]:
     return removed
 
 
-def _backup_fingerprint(data: bytes) -> str:
+# 判定"实质内容"时忽略的易变字段。
+# Chrome 每次保存书签都会重写 checksum / date_last_used / date_added 等；
+# Safari 的 plist 则会被系统周期性重写（ModificationDate、SyncData 等）。
+# 这些字段变了不代表书签变了 —— 否则光是切个标签页就会触发一次同步。
+VOLATILE_KEYS = frozenset({
+    "checksum", "sync_metadata", "date_last_used", "date_modified", "date_added",
+    "meta_info", "id", "guid",
+    "WebBookmarkModificationDate", "WebBookmarkSyncData", "WebBookmarkSync",
+    "SyncData", "WebBookmarkOrderIndex", "WebBookmarkOrder", "WebBookmarkServerID",
+    "WebBookmarkParentID", "WebBookmarkExternalID", "WebBookmarkSyncKey",
+    "WebBookmarkSyncBlob", "WebBookmarkTitleLastModified",
+})
+
+# 只对这些字段算指纹：它们才代表"书签的结构与内容"
+CONTENT_KEYS = ("WebBookmarkType", "WebBookmarkUUID", "WebBookmarkSpecialID",
+                "URLString", "Title", "URIDictionary", "Children", "type", "url", "name", "roots")
+
+
+def _strip_volatile(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _strip_volatile(v) for k, v in obj.items() if k not in VOLATILE_KEYS}
+    if isinstance(obj, (list, tuple)):
+        return [_strip_volatile(v) for v in obj]
+    return obj
+
+
+def content_fingerprint(data: bytes) -> str:
     """
-    备份去重用的指纹。直接对字节做哈希太"敏感"——Chrome 的 Bookmarks 里有 checksum、
-    date_last_used 等每次都会变的字段，Safari 的 plist 也会被系统周期性重写，
-    内容其实没变却会各存一份。这里先剥掉这些易变字段再算指纹。
+    对"书签的实质内容"算指纹，忽略易变字段。用于两条判断：
+      1. 备份去重：内容没变就不新增备份；
+      2. 实时同步触发：书签没变就不空转同步（浏览器切标签页也会重写文件）。
+    解析失败时退化为对原始字节取哈希（宁可多同步，不能漏）。
+    """
+    if not data:
+        return hashlib.sha256(b"").hexdigest()
+    stripped: Any = None
+    try:
+        obj = json.loads(data.decode("utf-8"))
+        stripped = _strip_volatile(obj) if isinstance(obj, dict) and "roots" in obj else obj
+    except (ValueError, UnicodeDecodeError):
+        try:
+            obj = plistlib.loads(data)
+        except Exception:  # noqa: BLE001
+            return hashlib.sha256(data).hexdigest()
+        stripped = _plist_content(obj) if isinstance(obj, dict) and "Children" in obj else obj
+    return hashlib.sha256(json_dumps_compact(stripped).encode("utf-8")).hexdigest()
+
+
+def _plist_content(node: Any) -> Any:
+    """把 Safari 的 plist 归约成"只含内容字段"的结构，便于跨版本稳定比较。"""
+    if isinstance(node, dict):
+        out = {}
+        for key in CONTENT_KEYS:
+            if key in node:
+                out[key] = _plist_content(node[key])
+        return out
+    if isinstance(node, (list, tuple)):
+        return [_plist_content(v) for v in node]
+    return node
+
+
+def file_content_fingerprint(path: Path, cache: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """
+    文件内容的实质指纹。带缓存：先看 (size, mtime_ns)，没变就直接复用上次结果，
+    避免每次轮询都解析整个书签文件。
     """
     try:
-        raw = json.loads(data.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        return hashlib.sha256(data).hexdigest()
-    if not isinstance(raw, dict) or "roots" not in raw:
-        return hashlib.sha256(data).hexdigest()
-    volatile = {"checksum", "sync_metadata", "date_last_used", "date_modified", "date_added",
-                "meta_info", "id", "guid"}
-
-    def strip(node: Any) -> Any:
-        if isinstance(node, dict):
-            return {k: strip(v) for k, v in sorted(node.items()) if k not in volatile}
-        if isinstance(node, list):
-            return [strip(v) for v in node]
-        return node
-
-    return hashlib.sha256(json_dumps_compact(strip(raw)).encode("utf-8")).hexdigest()
+        st = path.stat()
+    except OSError:
+        return None
+    stamp = (st.st_size, st.st_mtime_ns)
+    if cache is not None:
+        cached = cache.get(str(path))
+        if cached and cached[0] == stamp:
+            return cached[1]
+    try:
+        digest = content_fingerprint(path.read_bytes())
+    except OSError:
+        return None
+    if cache is not None:
+        cache[str(path)] = (stamp, digest)
+    return digest
 
 
 def backup_file(path: Path, backups_dir: Path, keep: int = 20,
@@ -1538,7 +1597,7 @@ def backup_file(path: Path, backups_dir: Path, keep: int = 20,
     except OSError as exc:
         eprint("备份失败（继续执行）：%s：%s" % (path, exc))
         return None, False
-    digest = _backup_fingerprint(data)
+    digest = content_fingerprint(data)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     dest = backups_dir / ("%s.%s-%s%s" % (tag, stamp, digest[:12], path.suffix or ".bak"))
 
@@ -1550,7 +1609,7 @@ def backup_file(path: Path, backups_dir: Path, keep: int = 20,
             break
     if latest is not None:
         try:
-            if _backup_fingerprint(latest.read_bytes()) == digest:
+            if content_fingerprint(latest.read_bytes()) == digest:
                 return latest, False
         except OSError:
             pass
@@ -2447,6 +2506,7 @@ def cmd_watch(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
         print("  监听：%s" % "、".join(str(b.bookmarks_path) for b in backends))
         print("  参数：轮询 %.1fs / 静默判定 %.1fs / 兜底同步 %.0fs"
               % (w["interval"], w["settle"], w["resync_after"]))
+        print("  判定：只比对书签的实质内容；浏览器重写文件但书签没变时不会同步")
         print("  日志：%s" % sp["log"])
         print("  退出：Ctrl+C（后台运行用 bmsync watch-daemon start）")
         print("  提示：浏览器落盘前内存里的改动看不到，所以粒度取决于浏览器保存书签的频率。")
@@ -2465,18 +2525,40 @@ def cmd_watch(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
 
     # 变化检测状态：last_seen 是"已同步过的指纹"，pending 是"正在等待静默的那一份"。
     # 注意 pending 必须和 raw_change 同为"变化的那部分"，否则两者永远不相等、计时器会被反复重置。
+    # 两级判断：先用 (大小, mtime) 做廉价初筛，再用"实质内容指纹"确认。
+    # 只靠 mtime 会把"浏览器切个标签页就整份重写文件"也算成变化，导致空转同步。
+    fp_cache: Dict[str, Any] = {}
     last_seen = watch_fingerprints(backends)
+    last_content = {b.name: file_content_fingerprint(b.bookmarks_path, fp_cache) for b in backends}
     last_sync = now_ts()
     settle_since: Optional[float] = None
     pending: Optional[Dict[str, Any]] = None
     watch_started = now_ts()
+    skipped_noise = 0
 
     try:
         with file_lock(lock_path):
             while True:
                 time.sleep(w["interval"])
                 current = watch_fingerprints(backends)
-                raw_change = {name: fp for name, fp in current.items() if fp != last_seen.get(name)}
+                stat_change = {name: fp for name, fp in current.items() if fp != last_seen.get(name)}
+
+                # 文件被动过 → 再看实质内容有没有变。切标签页、改 checksum、系统重写 plist
+                # 都会让文件变化但书签没变，这类"噪音"直接记下指纹、不进入同步流程。
+                raw_change: Dict[str, Any] = {}
+                if stat_change:
+                    for name, fp in stat_change.items():
+                        backend = next(b for b in backends if b.name == name)
+                        if file_content_fingerprint(backend.bookmarks_path, fp_cache) != last_content.get(name):
+                            raw_change[name] = fp
+                        else:
+                            skipped_noise += 1
+                            log("  %s 文件被重写但书签内容未变，跳过同步（累计 %d 次）"
+                                % (backend.label, skipped_noise), 2, verbose)
+                    # 只有噪音时才在这里提前记账；真正的内容变化要等静默结束、同步完成后再记账，
+                    # 否则下一个 tick 会认为"没有变化"，把静默计时重置掉，真变化永远触发不了。
+                    if not raw_change:
+                        last_seen.update(current)
 
                 changed: Dict[str, Any] = {}
                 if raw_change:
@@ -2516,6 +2598,8 @@ def cmd_watch(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
                     last_sync = now_ts()
                     settle_since, pending = None, None
                     last_seen = watch_fingerprints(backends)   # 以写回后的状态为基准
+                    last_content = {b.name: file_content_fingerprint(b.bookmarks_path, fp_cache)
+                                    for b in backends}
                     flush = True
                 else:
                     # 长时间没有变化时也兜底同步一次（对齐"另一边被外部工具改动"等情况）
@@ -2527,6 +2611,8 @@ def cmd_watch(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
                         watch_log(sp, "兜底同步完成（%.0fs 无变化）" % w["resync_after"], verbose)
                         last_sync = now_ts()
                         last_seen = watch_fingerprints(backends)
+                        last_content = {b.name: file_content_fingerprint(b.bookmarks_path, fp_cache)
+                                        for b in backends}
 
                 if flush:
                     sys.stdout.flush()
