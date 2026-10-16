@@ -2060,8 +2060,10 @@ def cmd_install_scheduler(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     print("  1) launchctl print gui/$(id -u)/%s | grep -E 'last exit code|state'" % LAUNCHD_LABEL)
     print("     退出码 0 = 成功；2 = 文件不可读写（多半是没给完全磁盘访问权限）；3 = 浏览器没退出")
     print("  2) tail -20 %s" % state_paths(cfg)["log"])
-    print("注意：launchd 拉起的进程同样受 TCC 限制，需要给 %s 授予完全磁盘访问权限" % python)
-    print("      （在“完全磁盘访问权限”里点 + 号，按 Cmd+Shift+G 输入上面的路径即可添加）。")
+    # 只有在验证失败（多半是权限）时才展开讲授权步骤，成功时不制造无谓的焦虑
+    print("说明：launchd 拉起的进程不继承终端的权限；如果上面显示失败，")
+    print("      就到 系统设置 → 隐私与安全性 → 完全磁盘访问权限，点 + 号 →")
+    print("      Cmd+Shift+G 输入 %s 添加，然后重新运行本命令。" % python)
     return 0
 
 
