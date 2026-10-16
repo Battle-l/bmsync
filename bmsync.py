@@ -1338,6 +1338,11 @@ def save_state(sp: Dict[str, Path], state: Dict[str, Any], tree: Tree,
     atomic_write(sp["state"], json.dumps(state, ensure_ascii=False, indent=1).encode("utf-8"))
 
 
+def log_failure(sp: Dict[str, Path], reason: str, code: int) -> None:
+    """把失败原因写进 bmsync.log。定时任务跑失败时这是唯一的线索。"""
+    append_log(sp, ["[%s] 同步失败（退出码 %d）：%s" % (fmt_ts(now_ts()), code, reason)])
+
+
 def append_log(sp: Dict[str, Path], lines: Sequence[str]) -> None:
     try:
         sp["log"].parent.mkdir(parents=True, exist_ok=True)
@@ -1765,14 +1770,20 @@ def run_sync(cfg: Dict[str, Any], chrome: ChromeBackend, safari: SafariBackend, 
     for backend in (chrome, safari):
         readable, msg = check_readable(backend.bookmarks_path)
         if not readable:
-            eprint("[错误] 无法读取 %s 书签：%s\n       文件：%s" % (backend.label, msg, backend.bookmarks_path))
+            reason = "无法读取 %s 书签：%s（%s）" % (backend.label, msg, backend.bookmarks_path)
+            eprint("[错误] %s" % reason)
             if backend.is_safari:
                 eprint("       解决：系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 勾选运行本脚本的程序，并重启它。")
+                eprint("       注意：launchd/cron 拉起的进程也要单独授权（见 README 第 3 节）。")
+            log_failure(sp, reason, 2)
             return 2
         if not dry_run:
             writable, msg_w = check_writable(backend.bookmarks_path)
             if not writable:
-                eprint("[错误] 无法写入 %s 书签：%s\n       文件：%s" % (backend.label, msg_w, backend.bookmarks_path))
+                reason = "无法写入 %s 书签：%s（%s）" % (backend.label, msg_w, backend.bookmarks_path)
+                eprint("[错误] %s" % reason)
+                eprint("       若是定时任务报这个错，说明 launchd 没有磁盘访问权限，见 README 第 3 节。")
+                log_failure(sp, reason, 2)
                 return 2
 
     # 2) 进程
@@ -1784,8 +1795,10 @@ def run_sync(cfg: Dict[str, Any], chrome: ChromeBackend, safari: SafariBackend, 
             if proc:
                 running.append("%s（%s）" % (backend.label, proc))
         if running:
+            reason = "浏览器仍在运行：%s" % "、".join(running)
             eprint("[错误] 请先退出：%s" % "、".join(running))
             eprint("       浏览器运行时会用内存中的旧数据覆盖改动；确认无碍可加 --force。")
+            log_failure(sp, reason, 3)
             return 3
 
     # 3) 读取
@@ -1889,6 +1902,7 @@ def run_sync(cfg: Dict[str, Any], chrome: ChromeBackend, safari: SafariBackend, 
             lines.append("    backup  %s" % b)
         append_log(sp, lines)
         log("\n状态已保存：%s" % sp["state"], verbose)
+        log("改动记录已写入：%s（定时任务就是靠这里确认是否生效）" % sp["log"], verbose)
         if backups:
             log("备份：%s" % "、".join(backups), verbose)
 
@@ -1914,6 +1928,10 @@ def cmd_sync(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
 
 LAUNCHD_LABEL = "com.bmsync.sync"
 LAUNCHD_PATH = HOME / ("Library/LaunchAgents/%s.plist" % LAUNCHD_LABEL)
+# launchd 的 stdout/stderr 落在这里：~/Library/Logs 是系统认可的日志位置，launchd 必定可写。
+# 放在仓库的 state/ 下会有隐患——若仓库在外部卷或受保护目录，launchd 可能创建不了日志文件，
+# 于是任务失败时连一行线索都没有（表现为 .err.log 不存在）。
+LAUNCHD_LOG_DIR = HOME / "Library/Logs/bmsync"
 
 
 def cmd_install_scheduler(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
@@ -1921,8 +1939,14 @@ def cmd_install_scheduler(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     # 优先用系统自带的 python3：路径稳定，且方便在"完全磁盘访问权限"里单独勾选
     python = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else (sys.executable or "python3")
     interval = max(5, int(args.interval)) * 60
-    log_dir = state_paths(cfg)["dir"]
-    log_dir.mkdir(parents=True, exist_ok=True)
+    # 必须转成绝对路径：相对路径会被 launchd 按 WorkingDirectory 解析，容易踩坑
+    log_dir = (expand(args.log_dir).resolve() if getattr(args, "log_dir", None) else LAUNCHD_LOG_DIR)
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        eprint("无法创建日志目录 %s：%s" % (log_dir, exc))
+        eprint("可以换一个位置：bmsync install-scheduler --log-dir ~/somewhere")
+        return 1
     # 只有配置文件确实存在时才传 --config，否则让它走默认查找逻辑
     argv = [python, str(script)]
     config_arg = str(Path(args.config).resolve()) if args.config else str(APP_DIR / "config.json")
@@ -1956,6 +1980,13 @@ def cmd_install_scheduler(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
         eprint("可手动执行：launchctl load -w %s" % LAUNCHD_PATH)
         return 1
     print("查看：launchctl list | grep bmsync     立即运行：launchctl start %s" % LAUNCHD_LABEL)
+    print("任务日志：%s/scheduler.{out,err}.log" % log_dir)
+    print("改动记录：%s（每次同步的成功/失败都会写在这里）" % state_paths(cfg)["log"])
+    print("")
+    print("提醒：launchctl start 是异步的，执行后请用下面两条命令确认是否真的跑成功：")
+    print("  1) launchctl print gui/$(id -u)/%s | grep -E 'last exit code|state'" % LAUNCHD_LABEL)
+    print("     退出码 0 = 成功；2 = 文件不可读写（多半是没给完全磁盘访问权限）；3 = 浏览器没退出")
+    print("  2) tail -20 %s" % state_paths(cfg)["log"])
     print("注意：launchd 拉起的进程同样受 TCC 限制，需要给 %s 授予完全磁盘访问权限" % python)
     print("      （在“完全磁盘访问权限”里点 + 号，按 Cmd+Shift+G 输入上面的路径即可添加）。")
     return 0
@@ -2058,7 +2089,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = new_sub("status", help="查看两边书签数量与上次同步信息")
     p.set_defaults(func=cmd_status)
 
-    p = new_sub("sync", help="执行同步（核心命令）")
+    p = new_sub("sync", help="执行同步（核心命令）"
+                "｜退出码：0 成功 / 2 文件不可读写 / 3 浏览器未退出 / 1 其他错误")
     p.add_argument("--dry-run", "-n", action="store_true", help="只演练，不写任何文件")
     p.add_argument("--force", action="store_true", help="即使浏览器在运行也写入")
     p.add_argument("--prefer", choices=["newest", "chrome", "safari"], help="冲突时以哪边为准")
@@ -2089,6 +2121,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = new_sub("install-scheduler", help="安装 launchd 定时同步任务")
     p.add_argument("--interval", type=int, default=60, help="间隔分钟（默认 60，最小 5）")
+    p.add_argument("--log-dir", help="任务日志目录（默认 ~/Library/Logs/bmsync）")
     p.add_argument("--dry-run", "-n", action="store_true", help="只打印将要写入的 plist，不安装")
     p.set_defaults(func=cmd_install_scheduler)
 
@@ -2112,6 +2145,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
     cfg = load_config(Path(args.config) if args.config else None)
     if getattr(args, "quiet", False):
+        # --quiet 只压掉正常输出；报错仍然打到 stderr，否则定时任务失败时会毫无线索
         args.verbose = 0
     try:
         return args.func(cfg, args)

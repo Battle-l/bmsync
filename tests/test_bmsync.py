@@ -747,6 +747,33 @@ def scenario_missing_permission(tmp: Path):
     check("doctor 能给出诊断", "Safari" in proc.stdout and "失败" in proc.stdout)
     check("doctor 提到了完全磁盘访问权限", "完全磁盘访问权限" in proc.stdout)
 
+    # 回归：定时任务用 --quiet 运行，失败时必须仍有线索
+    # （否则 launchd 里跑失败就是一片寂静，连日志文件都不会有）
+    quiet_fail = sb.run("sync", "--quiet", expect=2)
+    check("--quiet 下报错仍打到 stderr", "无法读取" in quiet_fail.stderr,
+          "stderr=%r" % quiet_fail.stderr[:120])
+    log_path = sb.state_dir / "bmsync.log"
+    check("失败会写进 bmsync.log", log_path.exists() and "同步失败" in log_path.read_text(encoding="utf-8"),
+          "日志存在=%s" % log_path.exists())
+    if log_path.exists():
+        check("失败日志带退出码与原因",
+              "退出码 2" in log_path.read_text(encoding="utf-8"),
+              log_path.read_text(encoding="utf-8")[-160:])
+
+    # 回归：定时任务的日志目录必须在 launchd 一定可写的位置，且是绝对路径
+    sched = bmsync.build_parser().parse_args(["install-scheduler", "--dry-run"])
+    plist_preview = sb.run("install-scheduler", "--dry-run", "--log-dir", str(tmp / "sched-logs"),
+                           expect=None)
+    check("install-scheduler 能生成任务定义", "ProgramArguments" in plist_preview.stdout
+          or "StandardErrorPath" in plist_preview.stdout, plist_preview.stderr[:120])
+    check("任务日志用绝对路径",
+          str(tmp / "sched-logs") in plist_preview.stdout,
+          plist_preview.stdout[:200])
+    check("默认任务日志不放在仓库内",
+          str(bmsync.LAUNCHD_LOG_DIR).startswith(str(bmsync.HOME)),
+          str(bmsync.LAUNCHD_LOG_DIR))
+    del sched
+
 
 def main():
     tmp_root = HERE.parent / "state"

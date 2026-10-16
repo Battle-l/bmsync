@@ -19,12 +19,24 @@
 - 显式指定的配置文件不存在时，原先会静默回退到默认配置（可能在错误的浏览器配置上跑同步），
   现在会打印明确警告。
 
+### 修复（定时任务相关的可观测性）
+
+- **`--quiet` 不再吞掉报错**：定时任务用 `--quiet` 运行时，失败信息仍会打到 stderr。
+  原先 `--quiet` 把 verbose 置 0，导致 launchd 里跑失败时完全没有任何输出。
+- **失败也会写进 `state/bmsync.log`**：记录时间、退出码和原因，定时任务失败后有据可查。
+- **任务日志移到 `~/Library/Logs/bmsync/`**：原先放在仓库的 `state/` 下，若仓库位于外部卷或
+  受保护目录，launchd 可能连日志文件都创建不了，表现为 `scheduler.err.log` 不存在、毫无线索。
+  新增 `install-scheduler --log-dir` 可自定义，且强制转成绝对路径。
+- `install-scheduler` 安装时会打印任务日志位置和验证命令（含 `launchctl print` 查退出码）。
+- 权限失败时的提示明确了 launchd/cron 场景（读不到 Safari、写不了 Chrome 都指向同一处授权）。
+
 ### 新增
 
 - `tests/test_bmsync.py` 加入合成 Chrome 书签夹具：没有真实 Chrome 书签文件时也能完整测试，
   CI 与贡献者可直接运行。
 - `BMSYNC_TEST_CHROME` 环境变量，可指定任意书签文件做往返验证。
 - 回归测试场景「全局选项的位置无关性」（16 种参数组合 + 9 条真实 CLI 调用）。
+- 回归测试：`--quiet` 下报错可见、失败写入日志、任务日志为绝对路径且不落在仓库内。
 
 ## [1.0.0] - 2026-10-16
 
@@ -40,4 +52,4 @@
 - 每次写入前自动备份两边原文件，支持回滚
 - `doctor` / `status` / `export` / `import` / `init-config` 等子命令
 - launchd 定时同步（`install-scheduler` / `uninstall-scheduler`）
-- 67 项端到端测试，GitHub Actions 在 macOS 上跑测试 + ruff lint
+- 67 项端到端测试（当前已增至 73 项），GitHub Actions 在 macOS 上跑测试 + ruff lint

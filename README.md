@@ -18,7 +18,7 @@ Safari Bookmarks.plist ──┘   (基线 state.json)    └─→ 写回 Safar
 - 冲突按修改时间判定，并逐条打印冲突说明
 - 每次写入前自动备份两边原文件，随时可回滚
 - 支持 launchd 定时同步
-- 67 项端到端测试（含对真实 Chrome 书签的无损往返验证）
+- 73 项端到端测试（含对真实 Chrome 书签的无损往返验证）
 
 ---
 
@@ -94,13 +94,50 @@ Safari 的书签文件受 macOS 的 TCC 保护，`chmod`、`sudo` 都没用，�
 ./bin/bmsync install-scheduler --dry-run       # 只看看会写入什么，不真装
 ```
 
-装好后：
+装好后，**务必按下面的方式确认它真的生效了**（`launchctl start` 是异步的，敲完不代表跑成功）：
 
 ```bash
-launchctl list | grep bmsync        # 确认已加载
-launchctl start com.bmsync.sync     # 立刻跑一次试试
-tail -f state/scheduler.err.log     # 看运行日志（state/bmsync.log 里是改动明细）
+launchctl list | grep bmsync        # 1. 确认已加载（能看到 com.bmsync.sync）
+launchctl start com.bmsync.sync     # 2. 触发一次
+
+# 3. 看退出码——这一步最关键
+launchctl print gui/$(id -u)/com.bmsync.sync | grep -E 'last exit code|state'
+
+# 4. 看这次同步到底做了什么
+tail -20 state/bmsync.log
+```
+
+退出码的含义：
+
+| 退出码 | 含义 | 处理 |
+| --- | --- | --- |
+| `0` | 成功 | 没问题，改动明细在 `state/bmsync.log` |
+| `2` | 文件不可读写 | 多半是定时任务没有磁盘访问权限，见下面「launchd 的权限」 |
+| `3` | 浏览器没退出 | 退出 Chrome/Safari 后重试（任务用 `--force` 时不会出现这个码） |
+| `78` | launchd 根本没能启动进程 | 程序路径失效或不可执行，重新运行一次 `install-scheduler` 并重新加载 |
+| 其它 | 运行中出错 | 看 `~/Library/Logs/bmsync/scheduler.err.log` |
+
+任务日志固定放在 **`~/Library/Logs/bmsync/`**（`scheduler.out.log` / `scheduler.err.log`），不放仓库里——否则仓库在外部卷或受保护目录时，launchd 可能连日志文件都创建不了，失败时一点线索都没有。也可以换位置：
+
+```bash
+./bin/bmsync install-scheduler --interval 60 --log-dir ~/Documents/bmsync-logs
 ./bin/bmsync uninstall-scheduler    # 卸载
+```
+
+### launchd 的权限（失败时的头号原因）
+
+launchd 拉起的进程**不会继承终端的权限**，需要单独授权：
+
+1. 系统设置 → 隐私与安全性 → **完全磁盘访问权限** → `+`
+2. 按 `Cmd+Shift+G`，输入 `/usr/bin/python3` 并添加（这是定时任务实际使用的解释器；用 `./bin/bmsync install-scheduler` 装完会打印确切路径）
+3. 到 **隐私与安全性 → 文件与文件夹 / 完全磁盘访问权限** 里确认没有"可移除卷"相关的拦截——如果仓库放在外部磁盘（`/Volumes/...`），macOS 会额外要求"可移除卷"访问权限
+
+改完权限后重新加载一次任务：
+
+```bash
+launchctl bootout gui/$(id -u)/com.bmsync.sync 2>/dev/null
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bmsync.sync.plist
+launchctl start com.bmsync.sync
 ```
 
 也可以用 cron（注意换成你自己的路径）：
@@ -197,7 +234,7 @@ cp state/backups/chrome.20261016-195845.bak \
 bmsync/
 ├── bmsync.py                    # 全部实现，单文件，纯标准库
 ├── bin/bmsync                   # 启动器（可直接 ./bin/bmsync sync）
-├── tests/test_bmsync.py         # 67 项端到端测试
+├── tests/test_bmsync.py         # 73 项端到端测试
 ├── .github/
 │   ├── workflows/tests.yml      # CI：macOS 上跑测试 + lint
 │   └── ISSUE_TEMPLATE/          # Issue 模板（引导附带 doctor 输出）
