@@ -10,6 +10,7 @@ bmsync 自测：在临时沙盒里用真实的 Chrome 书签文件 + 合成的 S
 用法：/usr/bin/python3 tests/test_bmsync.py
 """
 
+import argparse
 import json
 import os
 import plistlib
@@ -1056,8 +1057,10 @@ def scenario_bridge(tmp: Path):
           json.dumps(delta["counts"], ensure_ascii=False))
     check("delta 不会要求删除 Chrome 已有书签",
           not any("c.example" in r["url"] for r in delta["remove"]), str(delta["remove"])[:120])
-    check("delta 里新增项都带目标路径",
-          all("path" in a and isinstance(a["path"], list) for a in delta["add"]))
+    check("delta 里新增项都带容器标识与目标路径",
+          all(a.get("container") in ("bar", "other") and isinstance(a.get("path"), list)
+              for a in delta["add"]),
+          json.dumps(delta["add"], ensure_ascii=False)[:160])
 
     # 12.3 扩展在线时同步不再改写 Chrome 文件（否则会和扩展互相覆盖）
     before = sb.chrome_bookmarks.read_bytes()
@@ -1092,8 +1095,55 @@ def scenario_bridge(tmp: Path):
     (stale / "state.json").write_text(json.dumps(stale_state, ensure_ascii=False), encoding="utf-8")
     delta2 = bmsync._bridge_delta(sp_stale, stale_cfg)
     want = [a for a in delta2["add"] if "only-safari" in a["url"]]
-    check("能给出待新增项及其路径", len(want) == 1 and want[0]["path"] == ["其他书签", "工具"],
+    check("能给出待新增项及其容器/路径",
+          len(want) == 1 and want[0]["container"] == "other" and want[0]["path"] == ["工具"],
           json.dumps(delta2["add"], ensure_ascii=False)[:200])
+
+    # 12.45 回归：扩展在线时，绝不能删除"用户刚在 Chrome 里加、基线还不知道"的书签
+    #        （曾经的严重 bug：/delta 基于旧基线比较，把用户新加的书签判定为多余并下令删除）
+    sp["bridge"].write_text(json.dumps({"last_seen": bmsync.now_ts()}), encoding="utf-8")
+    chrome_b, safari_b = bmsync.build_backends(cfg)
+    ns = argparse.Namespace(dry_run=False, force=True, prefer=None, direction=None,
+                            list_changes=False, max_show=0, quiet=True, json=False, verbose=0)
+    raw = json.loads(sb.chrome_bookmarks.read_text(encoding="utf-8"))
+    raw["roots"]["bookmark_bar"]["children"].append(url_node("用户刚加的", "https://user-just-added.example"))
+    sb.chrome_bookmarks.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    bmsync.run_sync(cfg, chrome_b, safari_b, sp, bmsync.load_state(sp), ns)
+    d_fresh = bmsync._bridge_delta(sp, cfg)
+    check("用户刚在 Chrome 加的书签不会被要求删除",
+          not any("user-just-added" in r["url"] for r in d_fresh["remove"]),
+          str(d_fresh["remove"])[:160])
+    check("用户刚加的书签仍在 Chrome 里",
+          any("user-just-added" in (i.url or "") for i in chrome_b.read_tree().items.values()))
+
+    # 12.46 只有"Safari 明确删除过（有墓碑）"的书签，才允许让扩展从 Chrome 删除。
+    #       注意：扩展在线时 Chrome 文件不会被打字（由扩展负责），所以这里验证的是
+    #       "墓碑里带上了 URL" + "delta 能据此下发删除"，而不是直接看 Chrome 文件。
+    sp["bridge"].unlink()                       # 先离线跑一次，让两边都拿到这本书签
+    sf2 = sb.read_safari()
+    sf2["Children"][0]["Children"].append(leaf("两边都有的", "https://both-sides.example"))
+    sb.install_safari(sf2)
+    sb.run("sync")
+    check("两边都拿到这本书签",
+          any("both-sides" in (i.url or "") for i in sb.chrome_tree().items.values()))
+
+    sp["bridge"].write_text(json.dumps({"last_seen": bmsync.now_ts()}), encoding="utf-8")
+    sf3 = sb.read_safari()
+    sf3["Children"][0]["Children"] = [c for c in sf3["Children"][0]["Children"]
+                                      if (c.get("URIDictionary") or {}).get("title") != "两边都有的"]
+    sb.install_safari(sf3)
+    bmsync.run_sync(cfg, chrome_b, safari_b, sp, bmsync.load_state(sp), ns)
+    tombstones = (json.loads((sb.state_dir / "state.json").read_text(encoding="utf-8"))
+                  .get("tombstones") or {})
+    check("墓碑记录了被删书签的 URL",
+          any(isinstance(v, dict) and "both-sides" in (v.get("url") or "")
+              for v in tombstones.values()), str(tombstones)[:200])
+    d_del = bmsync._bridge_delta(sp, cfg)
+    check("Safari 删除的书签会指示扩展从 Chrome 删除",
+          any("both-sides" in r["url"] for r in d_del["remove"]), str(d_del["remove"])[:160])
+    check("delta 不会顺手删除未同步过的 Chrome 书签",
+          not any("user-just-added" in r["url"] for r in d_del["remove"]),
+          str(d_del["remove"])[:160])
 
     # 12.5 扩展离线后恢复直接写文件
     sp["bridge"].unlink()
@@ -1129,7 +1179,7 @@ def scenario_bridge(tmp: Path):
 
     # 12.6 扩展文件齐全且 JSON 合法
     ext = HERE.parent / "extension"
-    for name in ("manifest.json", "background.js", "popup.html", "popup.js"):
+    for name in ("manifest.json", "background.js", "core.js", "test_core.js", "popup.html", "popup.js"):
         check("扩展文件存在：%s" % name, (ext / name).exists())
     manifest = json.loads((ext / "manifest.json").read_text(encoding="utf-8"))
     check("扩展用 mv3 且只申请 bookmarks 权限",
@@ -1138,6 +1188,18 @@ def scenario_bridge(tmp: Path):
     check("扩展只连本机地址", all("127.0.0.1" in h or "localhost" in h
                                   for h in manifest.get("host_permissions", [])),
           str(manifest.get("host_permissions")))
+    check("扩展用 module service worker（core.js 走 ESM 导入）",
+          manifest.get("background", {}).get("type") == "module",
+          str(manifest.get("background")))
+
+    # 扩展的核心逻辑用 node 单测（不需要 Chrome）；没装 node 就跳过
+    node = shutil.which("node")
+    if node is None:
+        print("  ⤵ 未安装 node，跳过扩展逻辑单测（有 node 的机器上会执行）")
+    else:
+        run_node = subprocess.run([node, str(ext / "test_core.js")], capture_output=True, text=True)
+        check("扩展核心逻辑单测（node，含英文界面场景）", run_node.returncode == 0,
+              (run_node.stdout or run_node.stderr)[-300:])
 
 
 def scenario_missing_permission(tmp: Path):

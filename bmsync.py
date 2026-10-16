@@ -1155,7 +1155,14 @@ def merge(base: Tree, chrome_tree: Tree, safari_tree: Tree, prefer: str = "newes
     for item_id in sorted([i for i, d in actions.items() if d == "delete"],
                           key=lambda i: -len(merged.path_ids(i))):
         if item_id in merged.items:
-            result.tombstones.extend(_remove_subtree(merged, item_id))
+            # 先把 URL 抄下来再删：_remove_subtree 之后条目就从 merged 里消失了，
+            # 而删除记录（墓碑）必须带上 URL —— 被删条目随后也会从基线移除，
+            # 只留 id 就再也拼不回"被删的是哪个 URL"。
+            doomed = [(rid, merged.items[rid].url or
+                       (base.items[rid].url if rid in base.items else None))
+                      for rid in merged.subtree_ids(item_id) if rid in merged.items]
+            _remove_subtree(merged, item_id)
+            result.tombstones.extend(doomed)
             log("  - %s" % base.label(item_id), verbose, 2)
 
     for item_id, winner in resolved.items():
@@ -1380,7 +1387,12 @@ def load_state(sp: Dict[str, Path]) -> Dict[str, Any]:
 
 
 def save_state(sp: Dict[str, Path], state: Dict[str, Any], tree: Tree,
-               summary: Dict[str, Any], tombstones: Iterable[str]) -> None:
+               summary: Dict[str, Any], tombstones: Iterable[Any]) -> None:
+    """
+    tombstones 支持两种形式：id 字符串，或 (id, url) 元组。
+    记录 URL 是必要的：书签被删掉后，它的条目也随之从基线移除，
+    只留 id 的话就再也拼不回"被删的是哪个 URL"（桥接要靠它判断能否从 Chrome 删除）。
+    """
     state["version"] = STATE_VERSION
     state["base"] = {
         "items": {i: it.to_state() for i, it in tree.items.items()},
@@ -1389,10 +1401,21 @@ def save_state(sp: Dict[str, Path], state: Dict[str, Any], tree: Tree,
     state["saved_at"] = now_ts()
     state["saved_at_human"] = fmt_ts(state["saved_at"])
     tomb = state.setdefault("tombstones", {})
-    for item_id in tombstones:
-        tomb[item_id] = now_ts()
-    cutoff = now_ts() - TOMBSTONE_TTL
-    state["tombstones"] = {k: v for k, v in tomb.items() if isinstance(v, (int, float)) and v > cutoff}
+    stamp = now_ts()
+    for entry in tombstones:
+        if isinstance(entry, (tuple, list)) and len(entry) == 2:
+            item_id, url = entry
+            tomb[item_id] = {"ts": stamp, "url": url}
+        else:
+            tomb[entry] = {"ts": stamp, "url": None}
+    cutoff = stamp - TOMBSTONE_TTL
+
+    def alive(rec: Any) -> bool:
+        if isinstance(rec, (int, float)):          # 旧格式：直接是时间戳
+            return rec > cutoff
+        return isinstance(rec, dict) and float(rec.get("ts", 0)) > cutoff
+
+    state["tombstones"] = {k: v for k, v in tomb.items() if alive(v)}
     history = state.setdefault("history", [])
     history.append({"ts": now_ts(), "human": fmt_ts(now_ts()), "summary": summary})
     state["history"] = history[-50:]
@@ -2327,20 +2350,47 @@ def _bridge_delta(sp: Dict[str, Path], cfg: Dict[str, Any]) -> Dict[str, Any]:
         if node.kind == "bookmark" and node.url:
             have.setdefault(norm_url(node.url), node)
 
+    # 容器一律用稳定标识（Chrome 的固定文件夹 ID：1=书签栏，2=其他书签）。
+    # 不能用标题：Chrome 的文件夹标题随界面语言变化（英文是 "Bookmarks bar"），
+    # 扩展按标题找容器会找不到、把书签塞错地方甚至静默失败。
+    def container_and_path(tree: Tree, path_names: List[str]) -> Tuple[str, List[str]]:
+        head = path_names[0] if path_names else CONTAINER_LABELS[OTHER_ID]
+        if head == CONTAINER_LABELS[BAR_ID]:
+            return "bar", path_names[1:]
+        return "other", path_names[1:]
+
     add, rename = [], []
     for url, node in want.items():
         full = rel_path(merged, node.id)
-        path = full[:-1] if full else []
+        container, path = container_and_path(merged, full[:-1] if full else [])
         if url not in have:
-            add.append({"title": node.name, "url": node.url, "path": path})
+            add.append({"title": node.name, "url": node.url, "container": container, "path": path})
         elif norm_name(have[url].name) != norm_name(node.name):
             rename.append({"url": node.url, "title": node.name, "currentTitle": have[url].name})
+    # 删除必须极其保守：只有"上次同步时两边都确认过（在基线里）"、而这次 Safari 那边
+    # 确实已经没有了的书签，才允许从 Chrome 删除。
+    #
+    # 为什么不能只比"Chrome 有、merged 没有"：merged 是从**持久化基线**算出来的，而基线
+    # 是上一次同步结束才写盘的。用户刚在 Chrome 里加的书签会先落进 Chrome 文件，此时基线
+    # 还不知道它 —— 若据此判定删除，扩展就会把用户刚加的书签删掉（实测发生过，日志里
+    # 表现为 同步 safari_del:1 → 扩展 remove:1）。加上"必须在基线里"这个前提就安全了：
+    # 未同步过的东西只会被"新增/保留"，永远不会被删。
+    state = load_state(sp)
+    base_items = state.get("base", {}).get("items") or {}
+    dead_urls = set()
+    for item_id, rec in (state.get("tombstones") or {}).items():
+        url = rec.get("url") if isinstance(rec, dict) else None
+        if not url and item_id in base_items:       # 旧格式：借基线里的条目补出 URL
+            url = base_items[item_id].get("url")
+        if url:
+            dead_urls.add(norm_url(url))
     remove = []
     for url, node in have.items():
-        if url in want:
+        if url in want or url not in dead_urls:
             continue
         full = rel_path(current, node.id)
-        remove.append({"url": node.url, "title": node.name, "path": full[:-1] if full else []})
+        container, path = container_and_path(current, full[:-1] if full else [])
+        remove.append({"url": node.url, "title": node.name, "container": container, "path": path})
     return {"add": add, "remove": remove, "rename": rename,
             "generated": fmt_ts(now_ts()),
             "counts": {"add": len(add), "remove": len(remove), "rename": len(rename)}}

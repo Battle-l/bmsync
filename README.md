@@ -181,9 +181,14 @@ Safari 的书签文件受 macOS 的 TCC 保护，`chmod`、`sudo` 都没用，�
 ```
 extension/
 ├── manifest.json    # MV3，只申请 bookmarks 权限
+├── core.js          # 应用改动的核心逻辑（与 chrome API 解耦，可用 node 直接测试）
+├── test_core.js     # node extension/test_core.js 即可自测
 ├── background.js    # 定时向本地桥接拉取"要新增/删除什么"，用官方 API 应用
 ├── popup.html/js    # 点扩展图标看连接状态
 ```
+
+> 容器定位用的是 Chrome 的**固定文件夹 ID**（书签栏 = `1`、其他书签 = `2`），
+> 而不是文件夹标题——标题会随界面语言变化（英文版是 `Bookmarks bar`），按标题找会失败。
 
 **安装**（一次性，约 1 分钟）：
 
@@ -192,6 +197,8 @@ extension/
 3. 点 **加载已解压的扩展程序**，选择仓库里的 `extension` 目录
 4. 在终端运行 `./bin/bmsync watch`（或 `watch-daemon start`）
 5. 点扩展图标，看到 **已连接** 就生效了
+
+> 更新过扩展代码后，需要到 `chrome://extensions` 点一下这个扩展的**刷新**按钮重新加载。
 
 **它如何工作**：`bmsync watch` 会在 `127.0.0.1:8765` 起一个只监听本机的桥接服务（可用 `watch.bridge_port` 改端口，设 `0` 关闭）。扩展每 20 秒拉一次差异，用 `chrome.bookmarks` 应用新增/删除/改名。
 
