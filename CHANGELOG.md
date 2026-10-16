@@ -45,6 +45,22 @@
 - **安装后立即触发一次并回报退出码**（`--no-verify` 可关闭），按退出码给出处置建议，
   并自动带出日志最后几行。
 
+### 新增（弹窗显示最近变动）
+
+- 桥接新增 **`GET /recent`**：返回待应用改动 + 同步历史（每次增删改数量）+ 扩展回报记录
+- 扩展弹窗改版：连接状态、**待应用到 Chrome 的清单**、**最近变动时间线**；图标角标显示待应用项数
+- `core.js` 新增 `describeEvent()` / `describePending()` 文案生成逻辑（与 DOM 解耦，可在 node 断言）
+
+### 修复（扩展在真实 Chrome 里会失效的两处）
+
+- **`core.js` 改为真正的 ES module**：原先是 UMD 包装，而 MV3 的 module service worker
+  `import * as BmsyncCore` 只能看到 `export`、看不到 `module.exports`，
+  会导致 `BmsyncCore.applyDelta is not a function`（弹窗"已连接"但改动应用不上）
+- **`tick()` 竞态**：上一轮未结束时直接返回上一轮结果（可能是初始的 null），
+  改为返回正在进行的 Promise；弹窗立刻查询也能拿到正确状态
+- 扩展测试补全：`test_core.mjs`（9 项）+ `test_background.mjs`（4 项，用假 chrome/fetch
+  加载真实后台脚本，验证应用、状态查询、最近变动、角标、`/applied` 回报）
+
 ### 修复（严重：桥接会删掉用户刚在 Chrome 加的书签）
 
 - **`/delta` 的删除判定改为"必须有墓碑"**：原先只要"Chrome 有、基线没有"就下令删除，

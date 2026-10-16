@@ -1179,7 +1179,8 @@ def scenario_bridge(tmp: Path):
 
     # 12.6 扩展文件齐全且 JSON 合法
     ext = HERE.parent / "extension"
-    for name in ("manifest.json", "background.js", "core.js", "test_core.js", "popup.html", "popup.js"):
+    for name in ("manifest.json", "background.js", "core.js", "popup.html", "popup.js",
+                 "test_core.mjs", "test_background.mjs"):
         check("扩展文件存在：%s" % name, (ext / name).exists())
     manifest = json.loads((ext / "manifest.json").read_text(encoding="utf-8"))
     check("扩展用 mv3 且只申请 bookmarks 权限",
@@ -1192,14 +1193,37 @@ def scenario_bridge(tmp: Path):
           manifest.get("background", {}).get("type") == "module",
           str(manifest.get("background")))
 
-    # 扩展的核心逻辑用 node 单测（不需要 Chrome）；没装 node 就跳过
+    # 扩展用 node 单测（不需要 Chrome）；没装 node 就跳过
     node = shutil.which("node")
     if node is None:
-        print("  ⤵ 未安装 node，跳过扩展逻辑单测（有 node 的机器上会执行）")
+        print("  ⤵ 未安装 node，跳过扩展单测（有 node 的机器上会执行）")
     else:
-        run_node = subprocess.run([node, str(ext / "test_core.js")], capture_output=True, text=True)
-        check("扩展核心逻辑单测（node，含英文界面场景）", run_node.returncode == 0,
-              (run_node.stdout or run_node.stderr)[-300:])
+        for script, label in (("test_core.mjs", "扩展核心逻辑单测（含英文界面场景）"),
+                              ("test_background.mjs", "扩展后台脚本单测（应用/状态/最近变动）")):
+            run_node = subprocess.run([node, str(ext / script)], capture_output=True, text=True)
+            check(label, run_node.returncode == 0, (run_node.stdout or run_node.stderr)[-300:])
+
+    # 3) 桥接 /recent：弹窗要展示的"最近变动"必须能拿到
+    srv2 = bmsync.start_bridge(cfg, sp, 0)
+    if srv2 is None:
+        check("桥接 /recent 可用", False, "桥接启动失败")
+    else:
+        port2 = srv2.server_address[1]
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/recent" % port2, timeout=5) as r:
+                recent = json.loads(r.read().decode())
+            check("桥接 /recent 返回待应用与历史",
+                  "pending" in recent and "events" in recent and isinstance(recent["events"], list),
+                  str(recent)[:200])
+            check("/recent 的历史里含同步记录",
+                  any(e.get("kind") == "sync" for e in recent["events"]),
+                  json.dumps(recent["events"], ensure_ascii=False)[:200])
+            check("/recent 里能看到扩展回报",
+                  any(e.get("kind") == "applied" for e in recent["events"]),
+                  json.dumps(recent["events"], ensure_ascii=False)[:200])
+        finally:
+            srv2.shutdown()
+            srv2.server_close()
 
 
 def scenario_missing_permission(tmp: Path):

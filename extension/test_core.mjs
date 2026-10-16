@@ -7,10 +7,8 @@
  *
  * 运行：node extension/test_core.js
  */
-'use strict';
-
-const assert = require('assert');
-const core = require('./core.js');
+import assert from 'node:assert';
+import * as core from './core.js';
 
 /** 一个最小可用的书签树模拟器，容器标题可由参数指定（模拟不同界面语言） */
 function makeChromeMock({ barTitle = 'Bookmarks bar', otherTitle = 'Other bookmarks' } = {}) {

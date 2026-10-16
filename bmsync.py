@@ -2297,6 +2297,7 @@ code{background:#f2f2f2;padding:1px 5px;border-radius:3px}</style></head><body>
 <ul>
 <li><code>GET /ping</code> —— 扩展心跳</li>
 <li><code>GET /delta</code> —— 取出"需要应用到 Chrome 的书签增删"</li>
+<li><code>GET /recent</code> —— 最近变动（待应用 + 同步历史 + 扩展回报）</li>
 <li><code>POST /applied</code> —— 扩展报告已应用</li>
 </ul>
 <p>浏览器里打开这个页面通常说明你误点了扩展的地址；关掉即可。</p>
@@ -2396,6 +2397,56 @@ def _bridge_delta(sp: Dict[str, Path], cfg: Dict[str, Any]) -> Dict[str, Any]:
             "counts": {"add": len(add), "remove": len(remove), "rename": len(rename)}}
 
 
+def bridge_recent(sp: Dict[str, Path], cfg: Dict[str, Any], limit: int = 20) -> Dict[str, Any]:
+    """
+    给扩展弹窗用的"最近变动"：
+      - pending：当前还没落地到 Chrome 的改动（扩展马上要做的）
+      - history：同步历史（每次的时间与增删改数量），外加扩展回报记录
+    """
+    state = load_state(sp)
+    pending = _bridge_delta(sp, cfg)
+    events: List[Dict[str, Any]] = []
+    for rec in (state.get("history") or [])[-limit:]:
+        summary = rec.get("summary") or {}
+        events.append({
+            "kind": "sync",
+            "at": rec.get("human") or fmt_ts(rec.get("ts")),
+            "chrome_add": summary.get("chrome_add", 0), "chrome_upd": summary.get("chrome_upd", 0),
+            "chrome_del": summary.get("chrome_del", 0),
+            "safari_add": summary.get("safari_add", 0), "safari_upd": summary.get("safari_upd", 0),
+            "safari_del": summary.get("safari_del", 0),
+            "merged": summary.get("merged_bookmarks"),
+        })
+    # 扩展回报（"已应用到 Chrome"）也当作一条记录，方便对照
+    try:
+        log_lines = sp["log"].read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        log_lines = []
+    for line in log_lines[-200:]:
+        if "扩展已应用改动：" not in line:
+            continue
+        stamp = line[1:20] if line.startswith("[") else ""
+        payload = line.split("扩展已应用改动：", 1)[1]
+        try:
+            info = json.loads(payload)
+        except ValueError:
+            continue
+        added = info.get("added", info.get("add", 0)) or 0
+        removed = info.get("removed", info.get("remove", 0)) or 0
+        renamed = info.get("renamed", info.get("rename", 0)) or 0
+        if not (added or removed or renamed):
+            continue                     # 空回报不值得占位
+        events.append({"kind": "applied", "at": stamp, "added": added,
+                       "removed": removed, "renamed": renamed})
+    events.sort(key=lambda e: e.get("at") or "", reverse=True)
+    return {
+        "pending": pending,
+        "events": events[:limit],
+        "counts": pending.get("counts") or {},
+        "generated": fmt_ts(now_ts()),
+    }
+
+
 def _bridge_touch(sp: Dict[str, Path]) -> None:
     try:
         atomic_write(sp["bridge"], json.dumps({"last_seen": now_ts()}).encode("utf-8"))
@@ -2448,6 +2499,9 @@ def start_bridge(cfg: Dict[str, Any], sp: Dict[str, Path], port: int) -> Optiona
                                             "version": __version__}).encode("utf-8"))
             elif path == "/delta":
                 self._send(200, json.dumps(_bridge_delta(sp, cfg), ensure_ascii=False)
+                           .encode("utf-8"))
+            elif path == "/recent":
+                self._send(200, json.dumps(bridge_recent(sp, cfg), ensure_ascii=False)
                            .encode("utf-8"))
             elif path == "/":
                 self._send(200, BRIDGE_PAGE.encode("utf-8"), "text/html; charset=utf-8")

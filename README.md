@@ -181,10 +181,11 @@ Safari 的书签文件受 macOS 的 TCC 保护，`chmod`、`sudo` 都没用，�
 ```
 extension/
 ├── manifest.json    # MV3，只申请 bookmarks 权限
-├── core.js          # 应用改动的核心逻辑（与 chrome API 解耦，可用 node 直接测试）
-├── test_core.js     # node extension/test_core.js 即可自测
+├── core.js          # 应用改动的核心逻辑（与 chrome API 解耦）
+├── test_core.mjs    # node extension/test_core.mjs 自测核心逻辑
+├── test_background.mjs  # node extension/test_background.mjs 自测后台脚本
 ├── background.js    # 定时向本地桥接拉取"要新增/删除什么"，用官方 API 应用
-├── popup.html/js    # 点扩展图标看连接状态
+├── popup.html/js    # 点扩展图标看：连接状态、待应用改动、最近变动
 ```
 
 > 容器定位用的是 Chrome 的**固定文件夹 ID**（书签栏 = `1`、其他书签 = `2`），
@@ -199,6 +200,15 @@ extension/
 5. 点扩展图标，看到 **已连接** 就生效了
 
 > 更新过扩展代码后，需要到 `chrome://extensions` 点一下这个扩展的**刷新**按钮重新加载。
+
+**弹窗里能看到什么**（点扩展图标）：
+
+- **连接状态**：已连接 / 未连接，以及上次检查时间
+- **待应用到 Chrome**：还没落地到 Chrome 的改动清单（最多列 4 条）
+- **最近变动**：每次同步的增删改数量 + 扩展"已应用到 Chrome"的回报，按时间倒序
+- 图标角标显示待应用项数（没有待办时不显示）
+
+需要更细的内容时看 `state/bmsync.log`（逐条改动明细）。
 
 **它如何工作**：`bmsync watch` 会在 `127.0.0.1:8765` 起一个只监听本机的桥接服务（可用 `watch.bridge_port` 改端口，设 `0` 关闭）。扩展每 20 秒拉一次差异，用 `chrome.bookmarks` 应用新增/删除/改名。
 

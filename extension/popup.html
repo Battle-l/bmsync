@@ -3,21 +3,44 @@
 <head>
   <meta charset="utf-8">
   <style>
-    body { font: 13px/1.6 -apple-system, "PingFang SC", sans-serif; width: 320px; margin: 0; padding: 14px; }
-    h3 { margin: 0 0 8px; font-size: 14px; }
-    .row { display: flex; justify-content: space-between; padding: 3px 0; }
-    .ok { color: #2e7d32; } .bad { color: #d32f2f; } .dim { color: #777; }
-    code { background: #f2f2f2; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
-    ul { margin: 6px 0 0; padding-left: 18px; }
-    #detail { margin-top: 10px; border-top: 1px solid #eee; padding-top: 8px; }
+    :root { color-scheme: light dark; }
+    body {
+      font: 13px/1.55 -apple-system, "PingFang SC", "Segoe UI", sans-serif;
+      width: 340px; margin: 0; padding: 12px 14px 14px;
+    }
+    h3 { margin: 0 0 8px; font-size: 14px; display: flex; justify-content: space-between; align-items: baseline; }
+    h4 { margin: 12px 0 6px; font-size: 12px; font-weight: 600; opacity: .7;
+         text-transform: uppercase; letter-spacing: .04em; }
+    .row { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
+    .ok { color: #2e7d32; } .bad { color: #d32f2f; } .dim { opacity: .65; }
+    .badge { font-size: 11px; padding: 1px 6px; border-radius: 9px; background: rgba(127,127,127,.18); }
+    ul { margin: 0; padding: 0; list-style: none; }
+    li.ev { padding: 5px 0; border-top: 1px solid rgba(127,127,127,.18); }
+    li.ev:first-child { border-top: none; }
+    .when { display: flex; justify-content: space-between; gap: 8px; }
+    .what { font-size: 12px; margin-top: 1px; }
+    .plus { color: #2e7d32; } .minus { color: #d32f2f; } .tilde { color: #b26a00; }
+    code { background: rgba(127,127,127,.18); padding: 1px 4px; border-radius: 3px; font-size: 11px; }
+    .empty { padding: 6px 0; }
+    #pending li { padding: 3px 0; }
+    .url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 250px; display: inline-block; vertical-align: bottom; }
   </style>
 </head>
 <body>
-  <h3>bmsync 桥接</h3>
-  <div class="row"><span>桥接服务</span><span id="online" class="dim">检查中…</span></div>
-  <div class="row"><span>上次检查</span><span id="at" class="dim">-</span></div>
-  <div id="detail" class="dim">正在查询…</div>
-  <p class="dim" style="margin-top:10px">
+  <h3>
+    <span>bmsync 桥接</span>
+    <span id="state" class="badge dim">检查中…</span>
+  </h3>
+  <div class="row"><span class="dim">上次检查</span><span id="at" class="dim">-</span></div>
+  <div id="err" class="bad bad" style="display:none"></div>
+
+  <h4>待应用到 Chrome</h4>
+  <ul id="pending"><li class="dim empty">查询中…</li></ul>
+
+  <h4>最近变动</h4>
+  <ul id="events"><li class="dim empty">查询中…</li></ul>
+
+  <p class="dim" style="margin:10px 0 0">
     需要在终端运行 <code>bmsync watch</code>（或常驻服务）才会连上。<br>
     本扩展只访问 <code>127.0.0.1</code>，不向外发送任何数据。
   </p>
