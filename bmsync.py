@@ -975,6 +975,7 @@ class MergeResult:
     changes: Dict[str, List[Change]] = field(default_factory=dict)
     conflicts: List[str] = field(default_factory=list)
     tombstones: List[str] = field(default_factory=list)
+    blocked_deletes: int = 0        # 被熔断拦下的删除条数（>0 说明检测到异常）
 
 
 def tree_from_state(base: Dict[str, Any]) -> Tree:
@@ -1075,6 +1076,7 @@ def _add_subtree(dst: Tree, src: Tree, item_id: str, new_parent: Optional[str]) 
 
 def merge(base: Tree, chrome_tree: Tree, safari_tree: Tree, prefer: str = "newest",
           extra_sources: Optional[Dict[str, Tree]] = None,
+          max_delete_ratio: float = 0.05, max_delete_count: int = 10,
           verbose: int = 0) -> MergeResult:
     """
     三方合并：
@@ -1150,6 +1152,26 @@ def merge(base: Tree, chrome_tree: Tree, safari_tree: Tree, prefer: str = "newes
             # actions：该条目最终要执行的动作（add / update / delete）
             resolved[item_id] = side
             actions[item_id] = decision
+
+    # ---- 删除熔断 ----
+    # 只删"一边没了"就当用户删了，是危险的：一侧文件若因 iCloud 覆盖、文件损坏或被重置
+    # 而瞬间变空/极少，工具会把这场故障当成用户意图，忠实复制到另一个浏览器 ——
+    # 一次故障变成两边全灭（实际发生过：Safari 文件被重写后，Chrome 被删到只剩 8 条）。
+    # 因此单次同步的删除量设上限：超过就整体拒绝删除，只做新增/修改，并留下明确告警。
+    delete_ids = [i for i, d in actions.items() if d == "delete"]
+    baseline_size = max(1, sum(1 for v in base.items.values() if v.kind == "bookmark"))
+    ratio_limit = float(max_delete_ratio or 0)
+    count_limit = int(max_delete_count or 0)
+    allowed = int(baseline_size * ratio_limit) if ratio_limit > 0 else 0
+    allowed = max(allowed, count_limit)
+    if delete_ids and allowed > 0 and len(delete_ids) > allowed:
+        result.blocked_deletes = len(delete_ids)
+        result.conflicts.append(
+            "⚠️ 本次要删除 %d 条（基线共 %d 条，上限 %d 条）—— 已在删除前熔断。"
+            "这一般意味着某一侧的书签文件被清空或大面积改写（iCloud 覆盖、文件损坏等），"
+            "而不是你真的删了这么多。已只执行新增/修改；确认确实要删请加 --allow-mass-delete 重跑。"
+            % (len(delete_ids), baseline_size, allowed))
+        actions = {k: v for k, v in actions.items() if v != "delete"}
 
     # ---- 第二遍：把结果套到统一树上（先删后增改，保证父子顺序） ----
     for item_id in sorted([i for i, d in actions.items() if d == "delete"],
@@ -1273,6 +1295,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "skip_folders": list(DEFAULT_SKIP_FOLDERS),
         "backup_keep": 20,            # 分级保留：30 天以上只留这么多份
         "backup_min_interval": 300,   # 距上次备份不足这么多秒且"实质内容"没变，就不新增备份
+        "max_delete_ratio": 0.05,     # 单次同步最多允许删除的比例（超过则熔断，保护数据）
+        "max_delete_count": 10,       # 单次同步最多允许删除的绝对条数（与比例取较大者）
         "require_browsers_closed": True,
     },
     "state_dir": str(APP_DIR / "state"),
@@ -2083,6 +2107,11 @@ def run_sync(cfg: Dict[str, Any], chrome: ChromeBackend, safari: SafariBackend, 
     else:
         prefer = getattr(args, "prefer", None) or cfg["sync"].get("prefer", "newest")
     skip = cfg["sync"].get("skip_folders") or []
+    if getattr(args, "allow_mass_delete", False):
+        # 显式确认：把上限抬到无穷（但仍在结果里报告实际删了多少）
+        cfg["sync"] = dict(cfg["sync"])
+        cfg["sync"]["max_delete_ratio"] = 0
+        cfg["sync"]["max_delete_count"] = 0
 
     # 1) 权限
     for backend in (chrome, safari):
@@ -2148,7 +2177,10 @@ def run_sync(cfg: Dict[str, Any], chrome: ChromeBackend, safari: SafariBackend, 
                 _add_subtree(left, chrome_tree, item_id, chrome_tree.items[item_id].parent_id)
 
     # 5) 合并
-    result = merge(base, left, right, prefer=prefer, extra_sources=extra_sources, verbose=verbose)
+    result = merge(base, left, right, prefer=prefer, extra_sources=extra_sources,
+                   max_delete_ratio=float(cfg["sync"].get("max_delete_ratio", 0.05) or 0),
+                   max_delete_count=int(cfg["sync"].get("max_delete_count", 10) or 0),
+                   verbose=verbose)
     merged = result.merged
     counts = {side: Counter(c.kind for c in changes) for side, changes in result.changes.items()}
     plan = {"chrome": plan_changes(merged, chrome_tree), "safari": plan_changes(merged, safari_tree)}
@@ -2392,8 +2424,23 @@ def _bridge_delta(sp: Dict[str, Path], cfg: Dict[str, Any]) -> Dict[str, Any]:
         full = rel_path(current, node.id)
         container, path = container_and_path(current, full[:-1] if full else [])
         remove.append({"url": node.url, "title": node.name, "container": container, "path": path})
+
+    # 同样的熔断：即使基线被污染，也不允许一次让扩展删掉一大批书签
+    base_size = max(1, sum(1 for v in base_items.values() if v.get("kind") == "bookmark"))
+    ratio_limit = float((cfg.get("sync") or {}).get("max_delete_ratio", 0.05) or 0)
+    count_limit = int((cfg.get("sync") or {}).get("max_delete_count", 10) or 0)
+    allowed = int(base_size * ratio_limit) if ratio_limit > 0 else 0
+    allowed = max(allowed, count_limit)
+    blocked = 0
+    if remove and allowed > 0 and len(remove) > allowed:
+        blocked = len(remove)
+        append_log(sp, ["[%s] ⚠️ 桥接熔断：本次要删除 %d 条（上限 %d 条），已拒绝下发。"
+                        "这一般意味着某一侧文件被清空或大面积改写，而不是你真的删了这么多。"
+                        % (fmt_ts(now_ts()), len(remove), allowed)])
+        remove = []
     return {"add": add, "remove": remove, "rename": rename,
             "generated": fmt_ts(now_ts()),
+            "blocked_removes": blocked,
             "counts": {"add": len(add), "remove": len(remove), "rename": len(rename)}}
 
 
@@ -3304,6 +3351,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list-changes", action="store_true", help="逐条列出改动")
     p.add_argument("--max-show", type=int, default=40, help="演练时最多显示多少条")
     p.add_argument("--quiet", action="store_true", help="静默模式（定时任务用）")
+    p.add_argument("--allow-mass-delete", action="store_true",
+                   help="允许单次删除大量书签（默认熔断，需要显式确认）")
     p.set_defaults(func=cmd_sync)
 
     p = new_sub("export", help="导出为 HTML（可手动导入）或 JSON")

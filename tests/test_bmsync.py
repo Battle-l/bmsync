@@ -1227,6 +1227,69 @@ def scenario_bridge(tmp: Path):
             srv2.server_close()
 
 
+def scenario_mass_delete_guard(tmp: Path):
+    """
+    删除熔断：一侧书签文件被清空/大面积改写时，绝不能把这场故障复制到另一侧。
+    真实事故：Safari 文件被覆盖后，Chrome 被删到只剩 8 条。
+    """
+    print("\n[13] 删除熔断（防止一侧故障被复制到另一侧）")
+    sb = Sandbox(tmp / "guard")
+    items = [url_node("书签%d" % i, "https://site%d.example" % i) for i in range(120)]
+    sb.install_chrome(chrome_fixture(items))
+    sb.install_safari(safari_fixture([leaf("Safari 原有", "https://s.example")]))
+    sb.write_config()
+    sb.run("sync")
+
+    def chrome_count():
+        return len([i for i in sb.chrome_tree().items.values() if i.kind == "bookmark"])
+
+    def base_count():
+        st = json.loads((sb.state_dir / "state.json").read_text(encoding="utf-8"))
+        return sum(1 for v in st["base"]["items"].values() if v["kind"] == "bookmark")
+
+    before = chrome_count()
+    check("同步后两侧都有全部书签", before == 121, "实际 %d" % before)
+
+    # 灾难：Safari 文件被清空（iCloud 覆盖 / 文件损坏 / 被重置）
+    sf = sb.read_safari()
+    sf["Children"] = [c for c in sf["Children"] if c.get("Title") == "BookmarksBar"]
+    sf["Children"][0]["Children"] = []
+    sb.install_safari(sf)
+    out = sb.run("sync", "-v")
+    check("熔断被触发并给出告警", "熔断" in (out.stdout + out.stderr),
+          (out.stdout + out.stderr)[-200:])
+    check("Chrome 书签没被删", chrome_count() == before, "被删到 %d" % chrome_count())
+    check("熔断后基线保持完整", base_count() >= before - 1, "基线 %d" % base_count())
+
+    # 恢复后不应再出现任何"删除"，且两侧内容一致
+    sf2 = sb.read_safari()
+    sf2["Children"][0]["Children"].append(leaf("恢复进来的", "https://restored.example"))
+    sb.install_safari(sf2)
+    out2 = sb.run("sync", "-v")
+    check("一侧恢复后不再触发熔断", "熔断" not in (out2.stdout + out2.stderr))
+    check("恢复的书签能同步过去",
+          any("restored" in (i.url or "") for i in sb.chrome_tree().items.values()))
+    check("Chrome 规模没有减少", chrome_count() >= before, "实际 %d（原 %d）" % (chrome_count(), before))
+
+    # 显式确认时才允许大批删除（用直接调用 merge 的方式验证限额逻辑本身）
+    big = bmsync.Tree()
+    for cid in bmsync.CONTAINERS:
+        big.add(bmsync.Item(id=cid, kind="folder", name=cid, parent_id=bmsync.ROOT_ID))
+    empty_side = bmsync.Tree()
+    for cid in bmsync.CONTAINERS:
+        empty_side.add(bmsync.Item(id=cid, kind="folder", name=cid, parent_id=bmsync.ROOT_ID))
+    for i in range(50):
+        big.add(bmsync.Item(id="u:https://x%d.example/" % i, kind="bookmark", name="x%d" % i,
+                            parent_id=bmsync.BAR_ID, url="https://x%d.example" % i, mtime=None))
+    res = bmsync.merge(big.clone(), empty_side, big.clone(), max_delete_ratio=0.05,
+                       max_delete_count=10)
+    check("合并层：超限删除被拦下", res.blocked_deletes >= 50, str(res.blocked_deletes))
+    check("合并层：拦下后给出明确说明",
+          any("熔断" in c for c in res.conflicts), str(res.conflicts)[:160])
+    res2 = bmsync.merge(big.clone(), empty_side, big.clone(), max_delete_ratio=0, max_delete_count=0)
+    check("合并层：显式放开后不再拦", res2.blocked_deletes == 0, str(res2.blocked_deletes))
+
+
 def scenario_missing_permission(tmp: Path):
     """Safari 文件不可读时要给出明确的 TCC 提示，而不是一堆 traceback。"""
     print("\n[8] 权限缺失时的提示")
@@ -1306,6 +1369,7 @@ def main():
     scenario_realtime(base)
     scenario_backups(base)
     scenario_bridge(base)
+    scenario_mass_delete_guard(base)
     scenario_missing_permission(base)
 
     print("\n" + "=" * 70)
