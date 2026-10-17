@@ -1465,6 +1465,55 @@ def scenario_asymmetric(tmp: Path):
     sb.run("sync")
     check("重复同步结果稳定", sorted(urls(sb.chrome_tree())) == before)
 
+    # 目标目录必须在**书签栏**下（不能被建到「书签菜单」里多出一层）
+    check("sync_chrome 直接在书签栏下",
+          "sync_chrome" in names(st, bmsync.BAR_ID), str(names(st, bmsync.BAR_ID)))
+    check("书签菜单里没有多余的 sync_chrome",
+          "sync_chrome" not in names(st, bmsync.OTHER_ID), str(names(st, bmsync.OTHER_ID)))
+
+    # 目录还不存在时：自动建在书签栏；且**绝不能**把 Safari 全部书签当成同步源
+    sb2 = Sandbox(tmp / "asym" / "no_folder")
+    sb2.install_chrome(chrome_fixture([url_node("Chrome 书签", "https://c-only.example")]))
+    sb2.install_safari(safari_fixture([leaf("Safari 草稿", "https://draft-only.example")], []))
+    sb2.write_config()
+    cfg2 = json.loads(sb2.config.read_text(encoding="utf-8"))
+    cfg2["sync"]["scope_safari"] = "sync_chrome"
+    sb2.config.write_text(json.dumps(cfg2, ensure_ascii=False), encoding="utf-8")
+    sb2.run("sync")
+    st2, ct2 = sb2.safari_tree(), sb2.chrome_tree()
+    check("目录不存在时自动建在书签栏",
+          "sync_chrome" in names(st2, bmsync.BAR_ID), str(names(st2, bmsync.BAR_ID)))
+    check("目录不存在时不会把 Safari 草稿当同步源灌进 Chrome",
+          NU("https://draft-only.example") not in urls(ct2), str(sorted(urls(ct2))))
+    sync2 = None
+    for i, it in st2.items.items():
+        if it.kind == "folder" and it.name == "sync_chrome":
+            sync2 = i
+            break
+    check("目录不存在时 sync_chrome 里只放 Chrome 的内容",
+          sync2 is not None and "Chrome 书签" in names(st2, sync2)
+          and "Safari 草稿" not in names(st2, sync2),
+          str(names(st2, sync2) if sync2 else None))
+
+    # 旧版本把目录建在了「书签菜单」里 → 应自动搬回书签栏，内容不丢
+    sb3 = Sandbox(tmp / "asym" / "wrong_place")
+    sb3.install_chrome(chrome_fixture([url_node("Chrome 书签", "https://c-only.example")]))
+    sf3 = safari_fixture([leaf("Safari 草稿", "https://draft-only.example")], [])
+    sf3["Children"][1]["Children"].append(folder("sync_chrome", [leaf("旧内容", "https://old.example")]))
+    sb3.install_safari(sf3)
+    sb3.write_config()
+    cfg3 = json.loads(sb3.config.read_text(encoding="utf-8"))
+    cfg3["sync"]["scope_safari"] = "sync_chrome"
+    sb3.config.write_text(json.dumps(cfg3, ensure_ascii=False), encoding="utf-8")
+    sb3.run("sync")
+    st3 = sb3.safari_tree()
+    check("建错位置的目录被搬到书签栏",
+          "sync_chrome" in names(st3, bmsync.BAR_ID), str(names(st3, bmsync.BAR_ID)))
+    check("书签菜单里不再残留 sync_chrome",
+          "sync_chrome" not in names(st3, bmsync.OTHER_ID), str(names(st3, bmsync.OTHER_ID)))
+    check("搬动后旧内容没丢",
+          NU("https://old.example") in urls(st3))
+
 
 def scenario_missing_permission(tmp: Path):
     """Safari 文件不可读时要给出明确的 TCC 提示，而不是一堆 traceback。"""

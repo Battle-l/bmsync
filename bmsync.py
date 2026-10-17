@@ -1065,6 +1065,15 @@ def pack_container(tree: Tree, orig: Tree, container_id: str, unwrap: bool = Fal
     return out
 
 
+def empty_scope_tree() -> Tree:
+    """空的同步输入树（只含三个伪容器）。用于"配置了目录但该目录还不存在"。"""
+    out = Tree()
+    for pid in PSEUDO_IDS:
+        out.add(Item(id=pid, kind="folder", name=PSEUDO_LABELS[pid], parent_id=PSEUDO_ROOT))
+    out.children[PSEUDO_ROOT] = list(PSEUDO_IDS)
+    return out
+
+
 def in_scope_tree(tree: Tree, folder_id: Optional[str]) -> Optional[Tree]:
     """取某个浏览器的"同步输入"：指定目录时只取该目录内容，否则整棵树按容器拆分。"""
     if folder_id is None:
@@ -3280,14 +3289,15 @@ def run_sync_asymmetric(cfg: Dict[str, Any], chrome: ChromeBackend, safari: Safa
     if scope_safari and s_folder is None:
         log("提示：Safari 里还没有「%s」目录，本次会创建它" % scope_safari, verbose)
 
-    left = in_scope_tree(chrome_tree, c_folder)        # 容器 → 命名目录
-    right = in_scope_tree(safari_tree, s_folder)
-    if right is None:
-        # Safari 侧目录不存在：当作空（写盘时会建出来）
-        right = Tree()
-        for pid in PSEUDO_IDS:
-            right.add(Item(id=pid, kind="folder", name=PSEUDO_LABELS[pid], parent_id=PSEUDO_ROOT))
-        right.children[PSEUDO_ROOT] = list(PSEUDO_IDS)
+    # 注意区分两种情况：
+    #   scope 未配置  → 用整棵树
+    #   scope 已配置但目录还不存在 → 必须是"空"，绝不能用整棵树
+    # （用整棵树会把 Safari 的全部书签当成同步源，反向灌进 Chrome，实测发生过）
+    left = in_scope_tree(chrome_tree, c_folder) if scope_chrome else in_scope_tree(chrome_tree, None)
+    if scope_safari:
+        right = in_scope_tree(safari_tree, s_folder) if s_folder else empty_scope_tree()
+    else:
+        right = in_scope_tree(safari_tree, None)
 
     base = tree_from_state(state["base"]) if state.get("base", {}).get("items") else None
     first_run = base is None or state.get("asym_scope") != (scope_chrome, scope_safari)
@@ -3307,10 +3317,7 @@ def run_sync_asymmetric(cfg: Dict[str, Any], chrome: ChromeBackend, safari: Safa
     # 先把 Google 侧（left）作为基准，再把 Safari 目标目录里的新增/改动并进来。
     # 这样 Safari 的其它书签（草稿区）永远不会被复制到 Chrome。
     # 反向来源只取 Safari 目标目录里的内容（草稿区永不进入同步）
-    rev_source = Tree()
-    for pid in PSEUDO_IDS:
-        rev_source.add(Item(id=pid, kind="folder", name=PSEUDO_LABELS[pid], parent_id=PSEUDO_ROOT))
-    rev_source.children[PSEUDO_ROOT] = list(PSEUDO_IDS)
+    rev_source = empty_scope_tree()
     for kid in right.children_of(PSEUDO_BAR):
         if kid in right.items:
             _add_subtree(rev_source, right, kid, PSEUDO_BAR)
@@ -3437,12 +3444,36 @@ def _chrome_scope_write_tree(chrome_tree: Tree, merged_scope: Tree,
 
 def _safari_scope_write_tree(safari_tree: Tree, merged_scope: Tree,
                              s_folder: Optional[str], scope_name: str) -> Tree:
-    """Safari 侧：把「书签栏」那部分收进目标目录，容器与目录外内容原样保留。"""
+    """
+    Safari 侧：把「书签栏」那部分收进目标目录，容器与目录外内容原样保留。
+
+    目标目录应当直接位于**书签栏（个人收藏）**下 —— 这是用户的直觉位置。
+    历史 bug：早期版本把目录建在了「书签菜单」(other) 下，多出一层；这里会把它搬回书签栏。
+    """
     out = safari_tree.clone()
-    target = s_folder
+    target: Optional[str] = None
+
+    if s_folder is not None and s_folder in out.items:
+        parent = out.items[s_folder].parent_id
+        if parent == BAR_ID:
+            target = s_folder
+        else:
+            # 建错位置（例如旧版本建在「书签菜单」里）：整棵搬进书签栏
+            for item_id in list(out.subtree_ids(s_folder)):
+                if item_id != s_folder:
+                    out.items.pop(item_id, None)
+                    out.children.pop(item_id, None)
+            if s_folder in out.children.get(parent, []):
+                out.children[parent].remove(s_folder)
+            out.items.pop(s_folder, None)
+            out.children.pop(s_folder, None)
+
     if target is None:
-        target = out.make_id(OTHER_ID, "folder", scope_name, None)
-        out.add(Item(id=target, kind="folder", name=scope_name, parent_id=OTHER_ID))
+        target = out.make_id(BAR_ID, "folder", scope_name, None)
+        if target not in out.items:
+            out.add(Item(id=target, kind="folder", name=scope_name, parent_id=BAR_ID,
+                         mtime=None))
+
     # 清掉目标目录原有内容
     if target in safari_tree.items:
         for item_id in list(safari_tree.subtree_ids(target)):
@@ -3451,6 +3482,7 @@ def _safari_scope_write_tree(safari_tree: Tree, merged_scope: Tree,
             out.items.pop(item_id, None)
             out.children.pop(item_id, None)
     out.children[target] = []
+
     # 书签栏内容铺开
     for kid in merged_scope.children_of(PSEUDO_BAR):
         if kid in merged_scope.items:
@@ -3461,10 +3493,25 @@ def _safari_scope_write_tree(safari_tree: Tree, merged_scope: Tree,
         if not kids:
             continue
         marker = out.make_id(target, "folder", PSEUDO_LABELS[pid], None)
-        out.add(Item(id=marker, kind="folder", name=PSEUDO_LABELS[pid], parent_id=target))
+        if marker not in out.items:
+            out.add(Item(id=marker, kind="folder", name=PSEUDO_LABELS[pid],
+                         parent_id=target, mtime=None))
         for kid in kids:
             _add_subtree(out, merged_scope, kid, marker)
     return out
+
+
+def find_stray_scope_folders(tree: Tree, scope_name: str, keep_id: Optional[str]) -> List[str]:
+    """找出同名、但不在书签栏里的重复同步目录（旧版本建错位置留下的）。"""
+    strays = []
+    for container in CONTAINERS:
+        for kid in tree.children_of(container):
+            if kid == keep_id or kid not in tree.items:
+                continue
+            node = tree.items[kid]
+            if node.kind == "folder" and norm_name(node.name) == norm_name(scope_name):
+                strays.append(kid)
+    return strays
 
 
 # --------------------------------------------------------------------------------------

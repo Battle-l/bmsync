@@ -321,7 +321,7 @@ launchctl start com.bmsync.sync
 }
 ```
 
-**效果**（`sync_chrome` 建在 Safari 的书签栏里）：
+**效果**（`sync_chrome` 直接建在 Safari 的**书签栏**里，不会多套一层）：
 
 ```
 Chrome                           Safari
@@ -340,12 +340,14 @@ Chrome                           Safari
 
 规则：
 
+- **目标目录直接位于 Safari 书签栏下**（`书签栏 / sync_chrome`），不会出现在「书签菜单」里
 - **Chrome 的容器结构一格不动**（书签栏、其他书签各回各的位置）
 - 书签栏内容**直接铺在** `sync_chrome` 下（不套一层「书签栏」）
 - 「其他书签」「移动设备书签」各在 `sync_chrome` 下建一个同名子目录
 - **双向**：在 Safari 的 `sync_chrome` 里加的书签会回写到 Chrome 的书签栏
 - **Safari 其它位置的书签（草稿区）永远不会被复制到 Chrome**
-- `sync_chrome` 不存在时会自动创建
+- `sync_chrome` 不存在时会在**书签栏**下自动创建
+- 若旧版本把目录建到了「书签菜单」里，会自动搬回书签栏（内容不丢）
 
 试运行：
 
