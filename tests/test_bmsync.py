@@ -1385,6 +1385,87 @@ def scenario_scope_and_flatten(tmp: Path):
     check("显式允许后不再拦截", "疑似被抹平" not in (out2.stdout + out2.stderr))
 
 
+def scenario_asymmetric(tmp: Path):
+    """
+    非对称同步：Chrome 保持原有目录结构，Safari 侧全部收进一个目录（如 sync_chrome）。
+    - Chrome 的容器结构不变（书签栏/其他书签各回各的位置）
+    - 书签栏内容直接铺在 sync_chrome 下；其他书签/移动设备书签 各建同名子目录
+    - Safari 的其它书签（草稿区）永不被复制到 Chrome
+    - 双向：Safari 在 sync_chrome 里加的书签回写到 Chrome 书签栏
+    """
+    print("\n[15] 非对称同步（Chrome 保结构 / Safari 收进一个目录）")
+    sb = Sandbox(tmp / "asym")
+    sb.install_chrome(chrome_fixture([
+        url_node("根书签", "https://root.example"),
+        folder_node("工具", [url_node("工具-A", "https://tool-a.example"),
+                           folder_node("子目录", [url_node("深层", "https://deep.example")])]),
+    ], [url_node("其他里", "https://other.example")]))
+    sf = safari_fixture([leaf("Safari 自己的", "https://safari-own.example")], [])
+    sf["Children"][0]["Children"].append(folder("sync_chrome", []))
+    sb.install_safari(sf)
+    sb.write_config()
+    cfg = json.loads(sb.config.read_text(encoding="utf-8"))
+    cfg["sync"]["scope_safari"] = "sync_chrome"
+    sb.config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    sb.run("sync")
+
+    ct, st = sb.chrome_tree(), sb.safari_tree()
+
+    def names(tree, container):
+        return sorted(tree.items[k].name for k in tree.children_of(container) if k in tree.items)
+
+    def urls(tree):
+        return {bmsync.norm_url(i.url) for i in tree.items.values() if i.kind == "bookmark"}
+
+    check("Chrome 书签栏结构保持不变", names(ct, bmsync.BAR_ID) == ["工具", "根书签"],
+          str(names(ct, bmsync.BAR_ID)))
+    check("Chrome 其他书签结构保持不变", "其他里" in names(ct, bmsync.OTHER_ID),
+          str(names(ct, bmsync.OTHER_ID)))
+    check("Chrome 没有混进 Safari 自己的书签",
+          NU("https://safari-own.example") not in urls(ct))
+    check("Chrome 没有混进 sync_chrome 目录",
+          "sync_chrome" not in names(ct, bmsync.BAR_ID))
+
+    # Safari 侧：sync_chrome 里应有 Chrome 的内容
+    sync_id = None
+    for i, it in st.items.items():
+        if it.kind == "folder" and it.name == "sync_chrome":
+            sync_id = i
+            break
+    check("Safari 里有 sync_chrome 目录", sync_id is not None)
+    if sync_id:
+        inside = names(st, sync_id)
+        check("sync_chrome 下是书签栏内容（铺开，不套一层）",
+              "根书签" in inside and "工具" in inside and "书签栏" not in inside, str(inside))
+        check("其他书签内容收在同名子目录里", "其他书签" in inside, str(inside))
+        check("深层嵌套结构完整",
+              any("deep.example" in (it.url or "") for it in st.items.values()))
+
+    check("Safari 自己的书签仍在原处",
+          NU("https://safari-own.example") in urls(st))
+
+    # 双向：在 sync_chrome 里加一条 → 回写 Chrome 书签栏
+    sf2 = sb.read_safari()
+    for node in sf2["Children"][0]["Children"]:
+        if node.get("Title") == "sync_chrome":
+            node["Children"].append(leaf("Safari 在 sync 里加的", "https://from-sync.example"))
+    sf2["Children"][0]["Children"].append(leaf("Safari 草稿区", "https://draft-only.example"))
+    sb.install_safari(sf2)
+    sb.run("sync")
+    ct = sb.chrome_tree()
+    check("sync_chrome 里的新增回写到 Chrome",
+          NU("https://from-sync.example") in urls(ct), str(sorted(urls(ct))[:5]))
+    check("Safari 草稿区不会污染 Chrome",
+          NU("https://draft-only.example") not in urls(ct))
+    check("回写的书签落在 Chrome 书签栏",
+          "Safari 在 sync 里加的" in names(ct, bmsync.BAR_ID), str(names(ct, bmsync.BAR_ID)))
+
+    # 再同步一次应稳定
+    before = sorted(urls(ct))
+    sb.run("sync")
+    check("重复同步结果稳定", sorted(urls(sb.chrome_tree())) == before)
+
+
 def scenario_missing_permission(tmp: Path):
     """Safari 文件不可读时要给出明确的 TCC 提示，而不是一堆 traceback。"""
     print("\n[8] 权限缺失时的提示")
@@ -1466,6 +1547,7 @@ def main():
     scenario_bridge(base)
     scenario_mass_delete_guard(base)
     scenario_scope_and_flatten(base)
+    scenario_asymmetric(base)
     scenario_missing_permission(base)
 
     print("\n" + "=" * 70)

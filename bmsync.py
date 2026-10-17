@@ -991,15 +991,116 @@ def tree_from_state(base: Dict[str, Any]) -> Tree:
     return tree
 
 
+# 非对称同步用的伪容器 id：把"书签栏/其他书签/移动设备书签"放进同一个根下
+PSEUDO_ROOT = "scope:root"
+PSEUDO_BAR = "scope:bar"
+PSEUDO_OTHER = "scope:other"
+PSEUDO_MOBILE = "scope:mobile"
+PSEUDO_LABELS = {PSEUDO_BAR: "书签栏", PSEUDO_OTHER: "其他书签", PSEUDO_MOBILE: "移动设备书签"}
+PSEUDO_IDS = (PSEUDO_BAR, PSEUDO_OTHER, PSEUDO_MOBILE)
+# 写进 Safari 时，书签栏的内容直接铺开、不套一层
+UNWRAPPED = (PSEUDO_BAR,)
+
+
+def unpack_containers(tree: Tree) -> Tree:
+    """
+    把"书签栏/其他书签/移动设备书签"三个容器拆成同一个根下的三个命名目录。
+
+    用于非对称同步：Chrome 侧保留自己的容器结构，而 Safari 侧只有一个目标目录。
+    书签栏的内容在写进 Safari 时会直接铺在目标目录下（不套一层「书签栏」），
+    其他书签 / 移动设备书签 则会各建一个同名子目录，避免混在一起。
+    """
+    out = Tree()
+    for cid, label in ((PSEUDO_BAR, CONTAINER_LABELS[BAR_ID]),
+                       (PSEUDO_OTHER, CONTAINER_LABELS[OTHER_ID]),
+                       (PSEUDO_MOBILE, "移动设备书签")):
+        out.add(Item(id=cid, kind="folder", name=label, parent_id=PSEUDO_ROOT))
+    out.children[PSEUDO_ROOT] = list(PSEUDO_IDS)
+    # "移动设备书签"在统一树里是 other 下的一个普通目录（Chrome 侧的 synced 结构），
+    # 这里把它还原成独立的伪容器，避免和其它书签混在一起
+    mobile_names = {norm_name(MOBILE_FOLDER_NAME)}
+    for src_cid, dst_cid in ((BAR_ID, PSEUDO_BAR), (OTHER_ID, PSEUDO_OTHER),
+                             (MOBILE_ID, PSEUDO_MOBILE)):
+        for kid in tree.children_of(src_cid):
+            if kid not in tree.items:
+                continue
+            node = tree.items[kid]
+            if (dst_cid == PSEUDO_OTHER and node.kind == "folder"
+                    and norm_name(node.name) in mobile_names):
+                # 这一层只是"移动设备书签"的容器，内容直接放进伪容器，不保留这层壳
+                for grandkid in tree.children_of(kid):
+                    if grandkid in tree.items:
+                        _add_subtree(out, tree, grandkid, PSEUDO_MOBILE)
+                continue
+            _add_subtree(out, tree, kid, dst_cid)
+    return out
+
+
+def pack_container(tree: Tree, orig: Tree, container_id: str, unwrap: bool = False) -> Tree:
+    """
+    把 unpack 出来的命名目录装回某个浏览器的完整树。
+
+    unwrap=True 时，指定目录（书签栏）的内容直接铺进该容器，不保留那一层。
+    """
+    out = orig.clone()
+    for pid, key in ((PSEUDO_BAR, BAR_ID), (PSEUDO_OTHER, OTHER_ID), (PSEUDO_MOBILE, MOBILE_ID)):
+        if key not in out.items:
+            out.add(Item(id=key, kind="folder", name=key, parent_id=ROOT_ID))
+        out.children[key] = []
+        if pid not in tree.items:
+            continue
+        kids = tree.children_of(pid)
+        if unwrap and pid in UNWRAPPED:
+            for kid in kids:
+                if kid in tree.items:
+                    _add_subtree(out, tree, kid, key)
+        elif kids:
+            # 非书签栏的容器：保留一个同名子目录作为"位置标记"
+            name = PSEUDO_LABELS.get(pid, pid)
+            marker = f"{key}:{name}"
+            out.add(Item(id=marker, kind="folder", name=name, parent_id=key, mtime=None))
+            for kid in kids:
+                if kid in tree.items:
+                    _add_subtree(out, tree, kid, marker)
+    return out
+
+
+def in_scope_tree(tree: Tree, folder_id: Optional[str]) -> Optional[Tree]:
+    """取某个浏览器的"同步输入"：指定目录时只取该目录内容，否则整棵树按容器拆分。"""
+    if folder_id is None:
+        return unpack_containers(tree)
+    if folder_id not in tree.items:
+        return None
+    sub = scoped_clone(tree, folder_id, tree.items[folder_id].name)
+    # 目标目录下的内容当作"书签栏"（直接铺开的那一层）
+    out = Tree()
+    for pid in PSEUDO_IDS:
+        out.add(Item(id=pid, kind="folder", name=PSEUDO_LABELS[pid], parent_id=PSEUDO_ROOT))
+    out.children[PSEUDO_ROOT] = list(PSEUDO_IDS)
+    if folder_id in sub.items:
+        for kid in sub.children_of(folder_id):
+            if kid in sub.items:
+                _add_subtree(out, sub, kid, PSEUDO_BAR)
+    return out
+
+
 def resolve_scope_folder(tree: Tree, scope: str) -> Optional[str]:
     """把 "书签栏/同步" 这样的路径解析成树里的目录 id；找不到返回 None。"""
     parts = [p for p in str(scope).split("/") if p.strip()]
     if not parts:
         return None
+
+    # 单段写法（如 "sync_chrome"）：优先当成"某个容器下的同名目录"，其次才当成容器名。
+    # 否则像 "sync_chrome" 这种名字会被误判（历史 bug：曾被解析成容器 bar）。
+    if len(parts) == 1:
+        for cid in CONTAINERS:
+            found = tree.find_id(cid, "folder", parts[0].strip(), None)
+            if found:
+                return found
+
     label_to_id = {v: k for k, v in CONTAINER_LABELS.items()}
     head = label_to_id.get(parts[0].strip())
     if head is None:
-        # 也允许只写容器名（中文标签）或直接写目录名（在所有容器里找同名顶层目录）
         for cid in CONTAINERS:
             found = tree.find_id(cid, "folder", parts[0].strip(), None)
             if found:
@@ -1462,7 +1563,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "backup_min_interval": 300,   # 距上次备份不足这么多秒且"实质内容"没变，就不新增备份
         "max_delete_ratio": 0.05,     # 单次同步最多允许删除的比例（超过则熔断，保护数据）
         "max_delete_count": 10,       # 单次同步最多允许删除的绝对条数（与比例取较大者）
-        "scope": "",                  # 只同步这个目录（如 "书签栏/同步"）；空 = 整个书签树
+        "scope": "",                  # 对称范围：两侧同名目录之间同步（如 "书签栏/同步"）
+        "scope_chrome": "",           # 非对称：Chrome 侧参加同步的目录（空 = 整个书签树）
+        "scope_safari": "",           # 非对称：Safari 侧接收/回写的目录（如 "sync_chrome"）
         "no_delete": False,           # true = 永不删除，只做新增/修改（最保守）
         "require_browsers_closed": True,
     },
@@ -2343,6 +2446,13 @@ def run_sync(cfg: Dict[str, Any], chrome: ChromeBackend, safari: SafariBackend, 
             if item_id not in left.items:
                 _add_subtree(left, chrome_tree, item_id, chrome_tree.items[item_id].parent_id)
 
+    # 5) 非对称同步：一侧给整棵树/指定目录，另一侧全部收进一个目录
+    asym_chrome = (getattr(args, "scope_chrome", None) or cfg["sync"].get("scope_chrome") or "").strip()
+    asym_safari = (getattr(args, "scope_safari", None) or cfg["sync"].get("scope_safari") or "").strip()
+    if asym_chrome or asym_safari:
+        return run_sync_asymmetric(cfg, chrome, safari, sp, state, args,
+                                   asym_chrome, asym_safari)
+
     # 5) 合并（可限定在某个目录内进行）
     scope = (getattr(args, "scope", None) or cfg["sync"].get("scope") or "").strip()
     no_delete = bool(cfg["sync"].get("no_delete")) or bool(getattr(args, "no_delete", False))
@@ -3131,6 +3241,232 @@ def cmd_watch(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
         return 1
 
 
+def run_sync_asymmetric(cfg: Dict[str, Any], chrome: ChromeBackend, safari: SafariBackend,
+                        sp: Dict[str, Path], state: Dict[str, Any], args: argparse.Namespace,
+                        scope_chrome: str, scope_safari: str) -> int:
+    """
+    非对称同步：一侧（默认整个 Chrome 书签树）镜像进另一侧的一个目录。
+
+    典型用法：Chrome 保持原有目录结构，Safari 侧全部收进 sync_chrome 一个文件夹：
+      "scope_safari": "sync_chrome", "scope_chrome": ""
+    映射规则：
+      - Chrome 的「书签栏」内容直接铺在 sync_chrome 下（不套一层）
+      - 「其他书签」「移动设备书签」各在 sync_chrome 下建一个同名子目录
+      - 反向：sync_chrome 根下的新增/改动回写到 Chrome 的书签栏
+    """
+    verbose = getattr(args, "verbose", 1) or 0
+    dry_run = bool(getattr(args, "dry_run", False))
+    skip = cfg["sync"].get("skip_folders") or []
+
+    for backend in (chrome, safari):
+        readable, msg = check_readable(backend.bookmarks_path)
+        if not readable:
+            eprint("[错误] 无法读取 %s 书签：%s" % (backend.label, msg))
+            return 2
+        if not dry_run and not check_writable(backend.bookmarks_path)[0]:
+            eprint("[错误] 无法写入 %s 书签：%s"
+                   % (backend.label, check_writable(backend.bookmarks_path)[1]))
+            return 2
+
+    chrome_tree = chrome.read_tree(skip_folders=skip)
+    safari_tree = safari.read_tree(skip_folders=skip)
+
+    # 解析两侧的输入范围
+    c_folder = resolve_scope_folder(chrome_tree, scope_chrome) if scope_chrome else None
+    s_folder = resolve_scope_folder(safari_tree, scope_safari) if scope_safari else None
+    if scope_chrome and c_folder is None:
+        eprint("[错误] Chrome 里找不到目录「%s」" % scope_chrome)
+        return 2
+    if scope_safari and s_folder is None:
+        log("提示：Safari 里还没有「%s」目录，本次会创建它" % scope_safari, verbose)
+
+    left = in_scope_tree(chrome_tree, c_folder)        # 容器 → 命名目录
+    right = in_scope_tree(safari_tree, s_folder)
+    if right is None:
+        # Safari 侧目录不存在：当作空（写盘时会建出来）
+        right = Tree()
+        for pid in PSEUDO_IDS:
+            right.add(Item(id=pid, kind="folder", name=PSEUDO_LABELS[pid], parent_id=PSEUDO_ROOT))
+        right.children[PSEUDO_ROOT] = list(PSEUDO_IDS)
+
+    base = tree_from_state(state["base"]) if state.get("base", {}).get("items") else None
+    first_run = base is None or state.get("asym_scope") != (scope_chrome, scope_safari)
+    if first_run:
+        base = Tree()
+        for pid in PSEUDO_IDS:
+            base.add(Item(id=pid, kind="folder", name=PSEUDO_LABELS[pid], parent_id=PSEUDO_ROOT))
+        base.children[PSEUDO_ROOT] = list(PSEUDO_IDS)
+        for src in (left, right):
+            for kid in src.children_of(PSEUDO_BAR):
+                if kid in src.items and kid not in base.items:
+                    _add_subtree(base, src, kid, PSEUDO_BAR)
+        log("首次在该范围同步：以 Chrome 现有内容建立基线", verbose)
+    state["asym_scope"] = [scope_chrome, scope_safari]
+
+    # 反向要回写，但只认 sync_chrome 里的内容，且只回写到 Chrome 的书签栏：
+    # 先把 Google 侧（left）作为基准，再把 Safari 目标目录里的新增/改动并进来。
+    # 这样 Safari 的其它书签（草稿区）永远不会被复制到 Chrome。
+    # 反向来源只取 Safari 目标目录里的内容（草稿区永不进入同步）
+    rev_source = Tree()
+    for pid in PSEUDO_IDS:
+        rev_source.add(Item(id=pid, kind="folder", name=PSEUDO_LABELS[pid], parent_id=PSEUDO_ROOT))
+    rev_source.children[PSEUDO_ROOT] = list(PSEUDO_IDS)
+    for kid in right.children_of(PSEUDO_BAR):
+        if kid in right.items:
+            _add_subtree(rev_source, right, kid, PSEUDO_BAR)
+    left_for_merge = left
+    right_for_merge = rev_source
+    result = merge(base, left_for_merge, right_for_merge,
+                   prefer=getattr(args, "prefer", None) or cfg["sync"].get("prefer", "newest"),
+                   max_delete_ratio=float(cfg["sync"].get("max_delete_ratio", 0.05) or 0),
+                   max_delete_count=int(cfg["sync"].get("max_delete_count", 10) or 0),
+                   no_delete=bool(cfg["sync"].get("no_delete")) or bool(getattr(args, "no_delete", False))
+                   or first_run,
+                   scope_anchor=PSEUDO_BAR, verbose=verbose)
+    merged_scope = result.merged
+
+    counts = {side: Counter(c.kind for c in changes) for side, changes in result.changes.items()}
+    if verbose:
+        print("")
+        print("非对称同步：Chrome %s → Safari「%s」" % (scope_chrome or "（整个书签树）", scope_safari))
+        for side in ("chrome", "safari"):
+            c = counts[side]
+            print("  %-6s 新增 %d / 修改 %d / 删除 %d"
+                  % (side, c.get("add", 0), c.get("update", 0), c.get("delete", 0)))
+        print("  合并结果：%d 书签 / %d 目录"
+              % (merged_scope.stats()["bookmarks"], merged_scope.stats()["folders"]))
+        for line in result.conflicts[:8]:
+            print("  ⚠ %s" % line)
+
+    # 各自组装写盘树：Chrome 只回填它原本的容器，Safari 只回填目标目录
+    write_chrome = _chrome_scope_write_tree(chrome_tree, merged_scope, c_folder)
+    write_safari = _safari_scope_write_tree(safari_tree, merged_scope, s_folder, scope_safari)
+
+    if dry_run:
+        print("\n[演练] 不会写入任何文件。")
+        for label, target, cur in (("Chrome", write_chrome, chrome_tree),
+                                   ("Safari", write_safari, safari_tree)):
+            steps = plan_changes(target, cur)
+            print("  %s：%d 处" % (label, len(steps)))
+            for step in steps[:getattr(args, "max_show", 40)]:
+                print("     %s" % step)
+        return 0
+
+    keep = cfg["sync"].get("backup_keep", 20)
+    min_interval = float(cfg["sync"].get("backup_min_interval", 300) or 0)
+    backups = []
+    for backend in (chrome, safari):
+        b, created = backup_file(backend.bookmarks_path, sp["backups"], keep,
+                                 min_interval=min_interval)
+        if b:
+            backups.append("%s%s" % (b, "" if created else "（内容未变，复用）"))
+
+    direction = getattr(args, "direction", None) or cfg["sync"].get("direction", "both")
+    if direction != "chrome2safari":
+        if bridge_active(cfg):
+            log("  Chrome 写入：交给 Chrome 扩展", verbose)
+        else:
+            steps = chrome.write_tree(write_chrome,
+                                      chrome.build_native_map(chrome.read_raw(), write_chrome))
+            log("  Chrome 写入：%s" % ("；".join(steps) or "无变化"), verbose)
+    if direction != "safari2chrome":
+        steps = safari.write_tree(write_safari)
+        log("  Safari 写入：%s" % ("；".join(steps) or "无变化"), verbose)
+
+    summary = {"asym": True, "scope_chrome": scope_chrome, "scope_safari": scope_safari,
+               "chrome_add": counts["chrome"].get("add", 0),
+               "chrome_del": counts["chrome"].get("delete", 0),
+               "safari_add": counts["safari"].get("add", 0),
+               "safari_del": counts["safari"].get("delete", 0),
+               "merged_bookmarks": merged_scope.stats()["bookmarks"]}
+    save_state(sp, state, merged_scope, summary, result.tombstones)
+    append_log(sp, ["[%s] %s" % (fmt_ts(now_ts()), json.dumps(summary, ensure_ascii=False))]
+               + ["    backup  %s" % b for b in backups])
+    log("\n状态已保存：%s" % sp["state"], verbose)
+    return 0
+
+
+def _chrome_scope_write_tree(chrome_tree: Tree, merged_scope: Tree,
+                             c_folder: Optional[str]) -> Tree:
+    """
+    Chrome 侧写盘树：**保持 Chrome 自己的容器结构不变**。
+      - scope_chrome 为空（整个书签树）时：书签栏/其他书签/移动设备书签 分别回填
+      - scope_chrome 指定目录时：只回填那个目录
+    """
+    out = chrome_tree.clone()
+    if c_folder is None:
+        mapping = ((PSEUDO_BAR, BAR_ID), (PSEUDO_OTHER, OTHER_ID), (PSEUDO_MOBILE, None))
+        for pid, container in mapping:
+            kids = [k for k in merged_scope.children_of(pid) if k in merged_scope.items]
+            if container is None:
+                # 移动设备书签：统一树里是 other 下的一个普通目录
+                holder = out.make_id(OTHER_ID, "folder", MOBILE_FOLDER_NAME, None)
+                if kids:
+                    if holder not in out.items:
+                        out.add(Item(id=holder, kind="folder", name=MOBILE_FOLDER_NAME,
+                                     parent_id=OTHER_ID))
+                    for item_id in list(out.subtree_ids(holder)):
+                        if item_id != holder:
+                            out.items.pop(item_id, None)
+                            out.children.pop(item_id, None)
+                    out.children[holder] = []
+                    for kid in kids:
+                        _add_subtree(out, merged_scope, kid, holder)
+                continue
+            # 清掉该容器原有内容再回填
+            for item_id in list(out.children_of(container)):
+                if item_id in out.items:
+                    out.items.pop(item_id, None)
+                    out.children.pop(item_id, None)
+                    out.children.pop(item_id, None)
+            out.children[container] = []
+            for kid in kids:
+                _add_subtree(out, merged_scope, kid, container)
+        return out
+    # 只回填指定目录
+    for item_id in list(out.subtree_ids(c_folder)):
+        if item_id != c_folder:
+            out.items.pop(item_id, None)
+            out.children.pop(item_id, None)
+    out.children[c_folder] = []
+    for kid in merged_scope.children_of(PSEUDO_BAR):
+        if kid in merged_scope.items:
+            _add_subtree(out, merged_scope, kid, c_folder)
+    return out
+
+
+def _safari_scope_write_tree(safari_tree: Tree, merged_scope: Tree,
+                             s_folder: Optional[str], scope_name: str) -> Tree:
+    """Safari 侧：把「书签栏」那部分收进目标目录，容器与目录外内容原样保留。"""
+    out = safari_tree.clone()
+    target = s_folder
+    if target is None:
+        target = out.make_id(OTHER_ID, "folder", scope_name, None)
+        out.add(Item(id=target, kind="folder", name=scope_name, parent_id=OTHER_ID))
+    # 清掉目标目录原有内容
+    if target in safari_tree.items:
+        for item_id in list(safari_tree.subtree_ids(target)):
+            if item_id == target:
+                continue
+            out.items.pop(item_id, None)
+            out.children.pop(item_id, None)
+    out.children[target] = []
+    # 书签栏内容铺开
+    for kid in merged_scope.children_of(PSEUDO_BAR):
+        if kid in merged_scope.items:
+            _add_subtree(out, merged_scope, kid, target)
+    # 其他书签 / 移动设备书签 各建同名子目录
+    for pid in (PSEUDO_OTHER, PSEUDO_MOBILE):
+        kids = [k for k in merged_scope.children_of(pid) if k in merged_scope.items]
+        if not kids:
+            continue
+        marker = out.make_id(target, "folder", PSEUDO_LABELS[pid], None)
+        out.add(Item(id=marker, kind="folder", name=PSEUDO_LABELS[pid], parent_id=target))
+        for kid in kids:
+            _add_subtree(out, merged_scope, kid, marker)
+    return out
+
+
 # --------------------------------------------------------------------------------------
 # 定时任务
 # --------------------------------------------------------------------------------------
@@ -3506,8 +3842,11 @@ def cmd_init_config(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     data = {
         "chrome": {"user_data_dir": "~/Library/Application Support/Google/Chrome", "profile": "Default"},
         "safari": {"bookmarks_path": "~/Library/Safari/Bookmarks.plist"},
+        "mode": "manual",
         "sync": {"direction": "both", "prefer": "newest", "skip_folders": list(DEFAULT_SKIP_FOLDERS),
-                 "backup_keep": 20, "backup_min_interval": 300, "require_browsers_closed": True},
+                 "backup_keep": 20, "backup_min_interval": 300, "require_browsers_closed": True,
+                 "max_delete_ratio": 0.05, "max_delete_count": 10,
+                 "scope": "", "scope_chrome": "", "scope_safari": ""},
         "state_dir": str(sp["dir"]),
         "log_file": str(sp["log"]),
     }
@@ -3596,7 +3935,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-mass-delete", action="store_true",
                    help="允许单次删除大量书签（默认熔断，需要显式确认）")
     p.add_argument("--scope", metavar="目录",
-                   help='只同步这个目录（如 "书签栏/同步"）；两侧需有同名目录，默认整个书签树')
+                   help='对称范围：只同步两侧的同名目录（如 "书签栏/同步"）')
+    p.add_argument("--scope-chrome", metavar="目录",
+                   help="非对称：Chrome 侧参加同步的目录（留空 = 整个书签树）")
+    p.add_argument("--scope-safari", metavar="目录",
+                   help='非对称：把内容收进 Safari 的这个目录（如 "sync_chrome"）')
     p.add_argument("--no-delete", action="store_true",
                    help="本次同步不删除任何书签，只做新增/修改（最保守）")
     p.add_argument("--allow-flatten", action="store_true",

@@ -309,7 +309,54 @@ launchctl start com.bmsync.sync
 
 > launchd/cron 拉起的进程同样受 TCC 限制：如果它报权限错误，需要把 `/usr/bin/python3` 单独加进"完全磁盘访问权限"。
 
-## 5. 范围同步（推荐：只同步一个目录）
+## 5. 推荐配置：Chrome 保持结构，Safari 全部收进一个目录
+
+这是针对 **iOS Safari 抹平目录**问题最稳的方案，也是推荐用法：
+
+```json
+"sync": {
+  "scope_chrome": "",              // Chrome 侧：空 = 整个书签树都参加同步
+  "scope_safari": "sync_chrome",   // Safari 侧：全部收进这个目录
+  "no_delete": true                // 可选：更保守，只增不删
+}
+```
+
+**效果**（`sync_chrome` 建在 Safari 的书签栏里）：
+
+```
+Chrome                           Safari
+书签栏                            书签栏
+├── 根书签                        ├── （Safari 自己的书签，不动）
+├── 工具                          ├── sync_chrome
+│   ├── 工具-A                    │   ├── 根书签            ← 书签栏内容直接铺开
+│   └── 子目录                    │   ├── 工具
+│       └── 深层                  │   │   ├── 工具-A
+其他书签                           │   │   └── 子目录
+└── 其他里                        │   │       └── 深层
+                                  │   └── 其他书签          ← 其他书签收进同名子目录
+                                  │       └── 其他里
+                                  └── （sync_chrome 之外的都不影响）
+```
+
+规则：
+
+- **Chrome 的容器结构一格不动**（书签栏、其他书签各回各的位置）
+- 书签栏内容**直接铺在** `sync_chrome` 下（不套一层「书签栏」）
+- 「其他书签」「移动设备书签」各在 `sync_chrome` 下建一个同名子目录
+- **双向**：在 Safari 的 `sync_chrome` 里加的书签会回写到 Chrome 的书签栏
+- **Safari 其它位置的书签（草稿区）永远不会被复制到 Chrome**
+- `sync_chrome` 不存在时会自动创建
+
+试运行：
+
+```bash
+./bin/bmsync sync --scope-safari sync_chrome --dry-run -v
+./bin/bmsync sync --scope-safari sync_chrome          # 正式执行
+```
+
+> 也可以反过来（Safari 保结构、Chrome 收进一个目录）：`"scope_chrome": "sync_safari"` + `"scope_safari": ""`。
+
+## 6. 对称范围同步（两侧各一个同名目录）
 
 **为什么需要它**：iOS 上的 Safari 不显示第一级目录，内容会直接铺开；这个结构经 iCloud
 回到 macOS 时**目录就没了**。此时若按整个书签树同步，"目录消失"会被当成删除，
@@ -335,7 +382,7 @@ launchctl start com.bmsync.sync
 > 建议把要长期同步的书签都放进这个目录，其余按原来的习惯摆放 —— 这样 iOS 往返
 > 无论怎么抹平结构，都伤不到你的主书签。
 
-## 6. 抹平检测（自动兜底）
+## 7. 抹平检测（自动兜底）
 
 即使没开范围同步，工具也会识别 iOS 往返的特征：**书签数量基本不变，但目录大批消失**。
 识别到就本轮**不执行任何删除**，只做新增/修改，并打印告警：
@@ -347,7 +394,7 @@ launchctl start com.bmsync.sync
    确认要按现状同步请加 --allow-flatten。
 ```
 
-## 7. 删除熔断（数据安全）
+## 8. 删除熔断（数据安全）
 
 **任何一次同步都不会删除大量书签。** 默认上限是「基线的 5%」与「10 条」中较大的那个；超过就整体拒绝删除，只执行新增/修改，并打印告警：
 
@@ -372,7 +419,7 @@ launchctl start com.bmsync.sync
 
 确实要批量删除时加 `--allow-mass-delete`。
 
-## 8. 它到底怎么判断"谁改了什么"
+## 9. 它到底怎么判断"谁改了什么"
 
 关键在于 `state/state.json` 里保存的**基线**（上次同步结束时的统一状态）。每次同步做三方比对：
 
@@ -389,7 +436,7 @@ launchctl start com.bmsync.sync
 
 **顺序不作为同步目标**——两个浏览器的排序机制不同，强行对齐只会每次都被判定成改动。内容与层级保证一致，顺序各自保留。
 
-## 9. 特别说明（重要）
+## 10. 特别说明（重要）
 
 - **首次同步会把两个浏览器的书签并成一份**（不推断删除，避免误删）。之后才进入增量模式。
 - **Chrome 的"移动设备书签"**：统一树里它就是 `其他书签/移动设备书签` 这个普通目录；写回 Chrome 时会还原到 `synced → Mobile bookmarks` 容器。若 Chrome 把书签直接挂在 `synced` 下，会被整理进 `Mobile bookmarks` 文件夹（保留原有 guid，只影响结构，不丢数据）。
@@ -403,7 +450,7 @@ launchctl start com.bmsync.sync
   3. **分级保留**：24 小时内全留、1 周内每小时 1 份、1 个月内每天 1 份、更早只留 `backup_keep` 份
 - 只同步**书签**，不碰历史记录、扩展、密码等其他数据。
 
-## 10. 配置文件
+## 11. 配置文件
 
 `./bin/bmsync init-config` 会在仓库目录生成 `config.json`：
 
@@ -450,7 +497,7 @@ launchctl start com.bmsync.sync
 ./bin/bmsync --config ~/bm-work.json sync
 ```
 
-## 11. 出问题时
+## 12. 出问题时
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
@@ -468,7 +515,7 @@ cp state/backups/chrome.20261016-195845.bak \
    ~/Library/Application\ Support/Google/Chrome/Default/Bookmarks
 ```
 
-## 12. 项目结构
+## 13. 项目结构
 
 ```
 bmsync/
@@ -488,7 +535,7 @@ bmsync/
     └── export/                  # export 命令的输出
 ```
 
-## 13. 开发与贡献
+## 14. 开发与贡献
 
 欢迎提 Issue 和 PR，见 [CONTRIBUTING.md](CONTRIBUTING.md)。跑测试：
 
@@ -507,9 +554,9 @@ pip install ruff
 ruff check .
 ```
 
-## 14. 已知限制
+## 15. 已知限制
 
-- 顺序不同步（理由见第 8 节）。
+- 顺序不同步（理由见第 9 节）。
 - Safari 里"收藏"和书签栏是同一份数据；在 Safari 收藏一个页面会同时出现在书签栏，反向同步时也会进 Chrome 书签栏，这符合预期。
 - 极短时间内的双向改动仍以时间戳判定，可能无法完全反映你的真实意图；脚本会把冲突列出来供你核对。
 - **实时模式的延迟取决于浏览器**：书签先写在内存里，落盘后才能被看到（见第 3 节）。真正的"零延迟"做不到。

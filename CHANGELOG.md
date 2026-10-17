@@ -45,6 +45,22 @@
 - **安装后立即触发一次并回报退出码**（`--no-verify` 可关闭），按退出码给出处置建议，
   并自动带出日志最后几行。
 
+### 新增（非对称同步：Chrome 保结构，Safari 收进一个目录）
+
+按用户要求实现：Chrome 的目录结构完全不变，从 Chrome 同步过来的书签全部放进
+Safari 里新建的 `sync_chrome` 目录。
+
+- 配置 `sync.scope_chrome` / `sync.scope_safari`，或命令行 `--scope-chrome` / `--scope-safari`
+- 映射：书签栏内容**直接铺开**在 `sync_chrome` 下；「其他书签」「移动设备书签」
+  各建一个同名子目录（否则会混在一起）
+- 双向：Safari 在 `sync_chrome` 里加的书签回写到 Chrome 的书签栏
+- **Safari 其它位置的书签（草稿区）永远不会被复制到 Chrome**
+- 写盘按浏览器分别组装：Chrome 只回填自己的容器，Safari 只回填目标目录
+- `sync_chrome` 不存在时自动创建
+
+修掉过程中发现的自身缺陷：`resolve_scope_folder` 把单段目录名误当成容器名解析
+（`"sync_chrome"` 被解析成 `bar`）。
+
 ### 新增（范围同步 + 抹平检测：针对 iOS Safari 往返）
 
 用户诊断出真实根因：**iOS 上 Safari 不显示第一级目录、内容直接铺开**，这个结构经 iCloud
