@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# bmsync 启动器：把常见命令包装成短命令，避免每次敲 python3 路径。
+#
+# 用法（在仓库根目录）：
+#   ./bin/bmsync doctor
+#   ./bin/bmsync sync --dry-run -v
+#   ./bin/bmsync sync
+#   ./bin/bmsync status
+#   ./bin/bmsync install-scheduler --interval 60
+#
+# 想直接用 `bmsync` 命令，把它软链到 PATH 里：
+#   ln -s "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bmsync" /usr/local/bin/bmsync
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+# 用系统自带的 python3（macOS 上路径稳定，也方便在"完全磁盘访问权限"里单独勾选）
+PYTHON="${BMSYNC_PYTHON:-/usr/bin/python3}"
+
+if [ ! -x "$PYTHON" ]; then
+  PYTHON="$(command -v python3 || true)"
+fi
+if [ -z "${PYTHON}" ]; then
+  echo "找不到 python3，请先安装，或用 BMSYNC_PYTHON 指定解释器路径" >&2
+  exit 1
+fi
+
+# 不生成 __pycache__，避免在被 TCC 保护的目录附近触发权限问题
+export PYTHONDONTWRITEBYTECODE=1
+
+exec "$PYTHON" "$REPO_DIR/bmsync.py" "$@"
